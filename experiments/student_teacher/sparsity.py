@@ -11,6 +11,8 @@ from functools import partial
 from jax.scipy.special import erf
 from timer_class import Timer
 from loss_diff_plots import generate_loss_plots
+import sys
+from make_masks import create_masks
 
 
 # -------------------------
@@ -26,16 +28,8 @@ def scaled_normal_init(scale: float):
 
 
 class StudentHead(nn.Module):
-    hidden_dim: int
     @nn.compact
     def __call__(self, x):
-        # x = nn.Dense(
-        #     self.hidden_dim,
-        #     use_bias=False,
-        #     name="head_dense",
-        #     kernel_init=scaled_normal_init(0.001), 
-        # )(x)
-        # x = scaled_error(x)
         out = nn.Dense(
             1,
             name="head_out",
@@ -44,8 +38,15 @@ class StudentHead(nn.Module):
         return out
 
 class StudentNetwork(nn.Module):
+    '''
+    hidden_dim: shared representation
+    head_hidden_dim: sparse representation, linearly multiplied with unique student heads.
+    masks: binary vectors to turn off representation units
+    '''
     hidden_dim: int
     head_hidden_dim: int
+    masks: tuple # a tuple for (student1,student2) masks
+
     @nn.compact
     def __call__(self, x):
         # Backbone layer with scaled init
@@ -56,9 +57,15 @@ class StudentNetwork(nn.Module):
             kernel_init=scaled_normal_init(0.001),
             )(x) / jnp.sqrt(x.shape[-1])  # Keep normalization as-is
         x = scaled_error(x)
-        out1 = StudentHead(self.head_hidden_dim, name="head1")(x)
-        out2 = StudentHead(self.head_hidden_dim, name="head2")(x)
-        return out1, out2
+        x = nn.Dense(self.head_hidden_dim, use_bias=False,
+                     name="shared_head_layer",
+                     kernel_init=scaled_normal_init(0.001))(x)
+        
+        hidden_s1 = x*self.masks[0]
+        hidden_s2 = x*self.masks[1]
+        s1_out = StudentHead(name="head1")(hidden_s1)
+        s2_out = StudentHead(name="head2")(hidden_s2)
+        return s1_out, s2_out
 
 # We might manage params and opt_state directly for easier vmapping
 # than the full TrainState object.
@@ -102,21 +109,6 @@ def evaluate_metrics(params, apply_fn, test_inputs, t1_targets, t2_targets):
     loss1 = jnp.mean((pred1 - t1_targets)**2)
     loss2 = jnp.mean((pred2 - t2_targets)**2)
     return loss1, loss2
-
-# # Modified evaluation function with chunking:
-# @partial(jit, static_argnums=(1,6))
-# def evaluate_metrics(params, apply_fn, test_inputs, t1_targets, t2_targets, chunk_size=5000):
-#     def process_chunk(i, carry):
-#         acc1, acc2 = carry
-#         chunk = lax.dynamic_slice(test_inputs, (i*chunk_size, 0), (chunk_size, test_inputs.shape[1]))
-#         pred1, pred2 = apply_fn({'params': params}, chunk)
-#         return (
-#             acc1 + jnp.sum((pred1 - t1_targets[i*chunk_size:(i+1)*chunk_size])**2),
-#             acc2 + jnp.sum((pred2 - t2_targets[i*chunk_size:(i+1)*chunk_size])**2)
-#         )
-    # total_chunks = test_inputs.shape[0] // chunk_size
-    # final1, final2 = lax.fori_loop(0, total_chunks, process_chunk, (0.0, 0.0))
-    # return final1/test_inputs.shape[0], final2/test_inputs.shape[0]
 
 
 # -------------------------
@@ -295,19 +287,31 @@ def vectorized_train_for_v(
 # Main Execution Block
 # -------------------------
 if __name__ == "__main__":
+    '''example function call from commandline:
+    python ~/mtrl/experiments/student_teacher/sparsity.py d_hs n_active overlap m_type path
+    '''
+    args = sys.argv[1:]
+    arg_names = ['d_hs', 'n_active', 'overlap', 'm_type', 'path']
+    arg_dict = dict(zip(arg_names, args))
+    d_hs = int(arg_dict.get('d_hs', 4))
+    n_active = int(arg_dict.get('n_active', 2))
+    overlap = int(arg_dict.get('overlap', 0))
+    m_type = arg_dict.get('m_type', 'Determ')
+    parent_path = arg_dict.get('path', "/loss_data/tests/new_switch_point")
+    d_h = 4
+
     with Timer(print_time=True, show_memory=False):
         avail_gpus = jax.devices()
         print(jax.devices())
         # --- Configuration ---
-        # TODO make switch point a parameter #
-        d_in = 10_000
+        d_in = 1_000
         num_epochs = 3_000_000 # Total steps (will be split per task)
-        switch_point = int(num_epochs/3)
-        lr = 0.1 # lr is 1 for d_in=10_000, 0.1 for d_in=1_000
+        switch_point = int(num_epochs/2)
+        lr = 0.1 # lr is 1 for d_in=10_000, 0.1 for d_in=1_000 ### but 1 breaks
         sample_rate = 10_000 # Sample every N steps
-        v_values = np.linspace(0, 1, 11) # Reduced for testing
+        v_values = np.linspace(0, 1, 11)
         num_runs = 5
-        output_dir = f"./loss_data/tests/new_switch_point/"
+        output_dir = f".{parent_path}/d_h_{d_h}_d_hs_{d_hs}_n_active_{n_active}_overlap_{overlap}_m_type_{m_type}/"
         os.makedirs(output_dir, exist_ok=True)
         test_size = 50000
         batch_size = 1
@@ -340,13 +344,17 @@ if __name__ == "__main__":
         # --- Test Data (once) ---
         test_key, script_master_key = random.split(script_master_key)
         test_inputs = jax.random.normal(test_key, (test_size, d_in))
-        # test_inputs = jax.device_put(jax.random.normal(test_key, (test_size, d_in)), jax.devices('cpu')[0])
+
+        # --- Create Masks ---
+        mask_key, script_master_key = random.split(script_master_key)
+        mask1, mask2, overlap = create_masks(d_hs=d_hs, n_active=n_active, shared_neurons=overlap, mask_type=m_type, key=mask_key)
 
         # --- Model and Optimizer (once) ---
-        student_model = StudentNetwork(hidden_dim=2, head_hidden_dim=2)
+        student_model = StudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs, masks=(mask1, mask2))
         sample_input = jnp.ones((1, d_in)) # For initialization shape
         optimizer = optax.sgd(lr) # Create optimizer instance
 
+        print(f"Using {m_type}:\n{mask1}\n{mask2}\nOverlap: {overlap:.0f}%\n")
         # --- Loop over similarity values ---
         for v_idx, v in enumerate(v_values):
             print(f"\n--- Starting Similarity v={v:.2f} ({v_idx+1}/{len(v_values)}) ---")
@@ -405,12 +413,6 @@ if __name__ == "__main__":
             np.savez(filename, **final_results_for_v)
             print(f"Results Saved for v={v:.2f} (Shape e.g., train_loss: {final_results_for_v['train_loss'].shape})")
 
-        print(f"\n--- All experiments finished ---\nSaved at {output_dir}")
+        print(f"\n--- All experiments finished ---\nSaved at {output_dir}\nWith sparse values: {arg_dict}")
 
-    print("Saving Figures")
-    
 
-    fig_losses, fig_diffs = generate_loss_plots(output_dir, switch_point,
-                                                steps_after_switch=500000)
-    fig_losses.write_html(f'{output_dir}/losses_plot.html')
-    fig_diffs.write_html(f'{output_dir}/cf_trans_plots.html')

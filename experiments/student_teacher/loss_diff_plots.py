@@ -260,13 +260,16 @@ def generate_loss_plots(
         _log("Error: Epochs array is empty in the first result. Cannot determine switch epoch.")
         return None, None
 
-    if first_epochs.size < 2:
-        _log("Warning: Very few epochs found. Using the first epoch as switch point.")
-        switch_epoch_index = 0
-    else:
-        switch_epoch_index = first_epochs.size // 2
+    # if first_epochs.size < 2:
+    #     _log("Warning: Very few epochs found. Using the first epoch as switch point.")
+    #     switch_epoch_index = 0
+    # else:
+    #     switch_epoch_index = first_epochs.size // 2
+
+    switch_epoch_index = (first_epochs==switch_point).nonzero()[0][0]
     
     switch_epoch = int(first_epochs[switch_epoch_index])
+    assert switch_epoch == switch_point, set_trace()
     target_epoch_after = switch_epoch + steps_after_switch
     _log(f"Switch epoch determined as: {switch_epoch} (index {switch_epoch_index})")
     _log(f"Target epoch for difference calculation: {target_epoch_after}")
@@ -366,12 +369,13 @@ if __name__ == "__main__":
     print("Running example usage of generate_loss_plots...")
 
     # Define the directory where your data lives for the example
-    EXAMPLE_DATA_DIR = "./loss_data/tests/plots_flat_head_runs_5/" # Adjust if needed
+    EXAMPLE_DATA_DIR = "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/tests/new_switch_point/" # Adjust if needed
 
     # Call the main function
     # Set show_plots=True if you want plots to display automatically here
     figure1, figure2 = generate_loss_plots(
         data_dir=EXAMPLE_DATA_DIR,
+        switch_point=1_500_000,
         steps_after_switch=500000, # Example value
         show_plots=True,           # Show plots when run directly
         verbose=True               # Show log messages
