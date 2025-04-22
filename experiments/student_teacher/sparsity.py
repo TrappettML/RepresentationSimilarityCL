@@ -288,33 +288,34 @@ def vectorized_train_for_v(
 # -------------------------
 if __name__ == "__main__":
     '''example function call from commandline:
-    python ~/mtrl/experiments/student_teacher/sparsity.py d_hs n_active overlap m_type path
+    python ~/mtrl/experiments/student_teacher/sparsity.py d_hs sparsity overlap g_type path
     '''
     args = sys.argv[1:]
-    arg_names = ['d_hs', 'n_active', 'overlap', 'm_type', 'path']
+    arg_names = ['d_hs', 'sparsity', 'g_type', 'path']
     arg_dict = dict(zip(arg_names, args))
-    d_hs = int(arg_dict.get('d_hs', 4))
-    n_active = int(arg_dict.get('n_active', 2))
-    overlap = int(arg_dict.get('overlap', 0))
-    m_type = arg_dict.get('m_type', 'Determ')
-    parent_path = arg_dict.get('path', "/loss_data/tests/new_switch_point")
-    d_h = 4
+    d_hs = int(arg_dict.get('d_hs', 200))
+    sparsity = float(arg_dict.get('sparsity', 0.5))
+    g_type = arg_dict.get('g_type', 'Determ')
+    parent_path = arg_dict.get('path', "/loss_data/tests/gating_method/")
+    d_h = 200
+    print(f"{arg_dict}")
+    d_out = 1
 
     with Timer(print_time=True, show_memory=False):
         avail_gpus = jax.devices()
         print(jax.devices())
         # --- Configuration ---
-        d_in = 1_000
-        num_epochs = 3_000_000 # Total steps (will be split per task)
+        d_in = 800
+        num_epochs = 2_000_000 # Total steps (will be split per task)
         switch_point = int(num_epochs/2)
         lr = 0.1 # lr is 1 for d_in=10_000, 0.1 for d_in=1_000 ### but 1 breaks
         sample_rate = 10_000 # Sample every N steps
         v_values = np.linspace(0, 1, 11)
-        num_runs = 5
-        output_dir = f".{parent_path}/d_h_{d_h}_d_hs_{d_hs}_n_active_{n_active}_overlap_{overlap}_m_type_{m_type}/"
+        num_runs = 10
+        output_dir = f".{parent_path}/d_h_{d_h}_d_hs_{d_hs}_sparsity_{sparsity}_g_type_{g_type}/"
         os.makedirs(output_dir, exist_ok=True)
         test_size = 50000
-        batch_size = 1
+        batch_size = 200
 
         # --- Master key ---
         script_master_key = random.PRNGKey(42)
@@ -345,19 +346,19 @@ if __name__ == "__main__":
         test_key, script_master_key = random.split(script_master_key)
         test_inputs = jax.random.normal(test_key, (test_size, d_in))
 
-        # --- Create Masks ---
-        mask_key, script_master_key = random.split(script_master_key)
-        mask1, mask2, overlap = create_masks(d_hs=d_hs, n_active=n_active, shared_neurons=overlap, mask_type=m_type, key=mask_key)
-
-        # --- Model and Optimizer (once) ---
-        student_model = StudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs, masks=(mask1, mask2))
-        sample_input = jnp.ones((1, d_in)) # For initialization shape
-        optimizer = optax.sgd(lr) # Create optimizer instance
-
-        print(f"Using {m_type}:\n{mask1}\n{mask2}\nOverlap: {overlap:.0f}%\n")
+        print(f"Using {g_type}:\nSparsity: {sparsity:.2f}%\n")
         # --- Loop over similarity values ---
         for v_idx, v in enumerate(v_values):
-            print(f"\n--- Starting Similarity v={v:.2f} ({v_idx+1}/{len(v_values)}) ---")
+            # --- Create Masks ---
+            mask_key, script_master_key = random.split(script_master_key)
+            mask1, mask2, overlap = create_masks(d_in=d_hs, d_out=d_out, sparsity=sparsity, v=v, m_type=g_type, key=mask_key)
+
+            # --- Model and Optimizer (once) ---
+            student_model = StudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs, masks=(mask1, mask2))
+            sample_input = jnp.ones((1, d_in)) # For initialization shape
+            optimizer = optax.sgd(lr) # Create optimizer instance
+            
+            print(f"\n--- Starting Similarity v={v:.2f}\n{mask1=}\n{mask2=}\n{overlap=}\n({v_idx+1}/{len(v_values)}) ---")
 
             # --- Prepare for vectorized run ---
             v_master_key, script_master_key = random.split(script_master_key)
@@ -405,11 +406,14 @@ if __name__ == "__main__":
                 "train_loss": np.array(train_losses),
                 "test_loss1": np.array(test_losses1),
                 "test_loss2": np.array(test_losses2),
-                "epochs": epochs_array[:num_samples] # Ensure epochs match samples dim
+                "epochs": epochs_array[:num_samples], # Ensure epochs match samples dim
+                "mask1": mask1,
+                "mask2": mask2,
+                "overlap": overlap,
             }
 
             # --- Save the aggregated results ---
-            filename = os.path.join(output_dir, f"losses_v_{v:.2f}.npz")
+            filename = os.path.join(output_dir, f"losses_v_{v:.2f}_spars_{sparsity:.2f}.npz")
             np.savez(filename, **final_results_for_v)
             print(f"Results Saved for v={v:.2f} (Shape e.g., train_loss: {final_results_for_v['train_loss'].shape})")
 

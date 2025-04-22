@@ -1,8 +1,59 @@
 import jax
 import jax.numpy as jnp
 from typing import Tuple
+from ipdb import set_trace
 
-def create_masks(d_hs: int, # total num of student hidden neurons
+
+def random_gates(r_key, s, d_in, d_out, n_vectors):
+    d_in = int(d_in)
+    d_out = int(d_out)
+    random_keys = jax.random.split(r_key, n_vectors)
+    return jax.vmap(lambda k: jax.random.bernoulli(k, s, (d_in, d_out)))(random_keys).squeeze(-1).astype(jnp.float32)
+
+def deterministic_gates(key, v, s, d_in, d_out, n_vectors):
+    h = v + 0.4 * jnp.pi
+    theta = jnp.array([jnp.cos(h*jnp.pi), jnp.sin(h*jnp.pi)])
+    determ_keys = jax.random.split(key, n_vectors*2)
+
+    base = jax.vmap(lambda k: jax.random.uniform(k, (d_in, d_out)))(determ_keys)
+    base = jnp.reshape(base, (n_vectors, d_in, d_out, 2))
+    # print(f"{base.shape=}")
+    z = base @ theta.T
+    # print(f"{z.shape=}")
+    ones = jnp.ones_like(z)
+    g_determ = jnp.heaviside(z - (s-0.5), ones)
+    # print(f"{base.shape=}")
+    #####
+    # m = 10
+    # z_sigmoid = 1.5/ (1 + jnp.exp(-m*(z)))
+    # # # Create smooth threshold
+    # s = s-0.01
+    # g_determ = (z_sigmoid > s).astype(jnp.float32)
+    #######
+    return g_determ.squeeze(-1).astype(jnp.float32)
+    
+
+def create_masks(d_in: int,
+                  d_out: int,
+                  sparsity: float,
+                  v: float, # task similarity; 0: orthog, 1: same
+                  m_type: str, # determ or random
+                  key: jax.random.PRNGKey) -> Tuple[jnp.ndarray, jnp.ndarray, float]:
+    masks = None
+    m_type = m_type.lower()
+    if m_type=='random':
+        masks = random_gates(key, sparsity, d_in, d_out, 2) # get two repeats to return each mask
+    elif m_type=='determ':
+        masks = deterministic_gates(key, v, sparsity, d_in, d_out, 2)
+
+    assert masks != None, f"type not possible, got {m_type=}, should be either 'determ' or 'random'."
+    mask1 = masks[0, :]
+    mask2 = masks[1, :]
+    overlap = jnp.sum(jnp.multiply(mask1, mask2), axis=-1)/d_in
+    return mask1, mask2, overlap
+
+
+def _create_masks(d_hs: int, # total num of student hidden neurons
                  n_active: int, # num of active neurons
                  shared_neurons: int, # 
                  mask_type: str, # determ or random/shuffled 
@@ -56,60 +107,51 @@ def create_masks(d_hs: int, # total num of student hidden neurons
     # Calculate actual overlap percentage
     actual_overlap = jnp.sum(mask1 * mask2)
     overlap_percent = (actual_overlap / n_active) * 100
-    
+
     return mask1, mask2, overlap_percent
 
 # Example usage
 if __name__ == "__main__":
     key = jax.random.PRNGKey(42)
-    for m_type in ['determ', 'random']:
-        # Example 1: ([0,0,1,1], [1,1,0,0]) --> shuffled
-        mask1, mask2, overlap = create_masks(d_hs=4, n_active=2, shared_neurons=0, mask_type=m_type, key=key)
-        print(f"Example 1 {m_type}:\n{mask1}\n{mask2}\nOverlap: {overlap:.0f}%\n")
+    num_repeats = 100
 
-        # Example 1.1: ([0,1,1,1], [1,1,1,0]) --> shuffled
-        mask1, mask2, overlap = create_masks(d_hs=4, n_active=3, shared_neurons=2, mask_type=m_type, key=key)
-        print(f"Example 3 {m_type}:\n{mask1}\n{mask2}\nOverlap: {overlap:.0f}%")
-
-        # Example 2: ([0,1,1], [1,1,0]) --> shuffled
-        mask1, mask2, overlap = create_masks(d_hs=3, n_active=2, shared_neurons=1, mask_type=m_type, key=key)
-        print(f"Example 2 {m_type}:\n{mask1}\n{mask2}\nOverlap: {overlap:.0f}%\n")
-
-        # Example 3: ([0,0,0,1,1,1,1], [1,1,1,1,0,0,0]) --> shuffled
-        mask1, mask2, overlap = create_masks(d_hs=7, n_active=4, shared_neurons=1, mask_type=m_type, key=key)
-        print(f"Example 3 {m_type}:\n{mask1}\n{mask2}\nOverlap: {overlap:.0f}%")
-
-    # Format: (d_hs, k, shared_neurons, expected_overlap_percent)
+    # Format: (d_hs, n_active, shared_neurons, target_overlap_percent)
     test_cases = [
-        (4, 2, 0, 0),    # Completely separate
-        (3, 2, 1, 50),   # Half shared
-        (7, 4, 1, 25),   # Quarter shared
-        (5, 3, 2, 66.7), # High overlap
-        (10, 5, 3, 60)   # Medium overlap
+        (100,  .2, 1),    # completely separate
+        (100,  .2, .60),    # half shared
+        (100,  .40, .50),    # quarter shared
+        (100,  .30, .70),    # high overlap
+        (100, .50, .70)     # medium overlap
     ]
 
     for mask_type in ['determ', 'random']:
-        print(f"\n=== Testing {mask_type.upper()} masks ===")
-        
-        for case_idx, (d_hs, k, shared, target_ovlp) in enumerate(test_cases, 1):
-            print(f"\nCase {case_idx}: d_hs={d_hs}, k={k}, shared={shared}")
-            
-            # Generate masks
-            m1, m2, ovlp = create_masks(d_hs, k, shared, mask_type, key)
-            
-            # Print results
-            print(f"Mask1: {m1.astype(int)}")
-            print(f"Mask2: {m2.astype(int)}")
-            print(f"Overlap: {ovlp:.1f}% (Target: {target_ovlp}%)")
-            
-            # Automated checks
-            assert jnp.sum(m1) == k, f"Mask1 sparsity violated! Expected {k} active"
-            assert jnp.sum(m2) == k, f"Mask2 sparsity violated! Expected {k} active"
-            assert abs(ovlp - target_ovlp) < 0.1, "Overlap percentage mismatch!"
-            
-            if mask_type == 'determ':
-                # Additional deterministic checks
-                actual_shared = jnp.sum(m1 * m2)
-                assert actual_shared == shared, "Shared neuron count mismatch!"
-                
-            print("✓ All checks passed!")
+        print(f"\n=== Testing {mask_type.upper()} masks over {num_repeats} repeats ===")
+        for idx, (d_hs, sparsity, v_param) in enumerate(test_cases, 1):
+
+            overlaps = []
+            # generate a fresh subkey each repeat
+            for rep in range(num_repeats):
+                subkey = jax.random.fold_in(key, rep)
+                mask1, mask2, ovlp = create_masks(
+                    d_in=d_hs,
+                    d_out=1,
+                    sparsity=sparsity,
+                    v=v_param,
+                    type=mask_type,
+                    key=subkey
+                )
+                overlaps.append(float(ovlp))
+
+            mean_ovlp = jnp.mean(jnp.array(overlaps))
+            std_ovlp  = jnp.std(jnp.array(overlaps))
+
+            print(f"\nCase {idx}: d_hs={d_hs}, {sparsity=}, {v_param=}")
+            print(f" Mean overlap: {mean_ovlp:.2f}%  ± {std_ovlp:.1f}% ")
+            print(f"{mask1=}\n{mask2}\n")
+
+            # # quick sanity check on mean
+            # assert abs(mean_ovlp - target) < 5.0, (
+            #     f"Mean overlap {mean_ovlp:.1f}% deviates more than 1% from target {target}%"
+            # )
+
+        print("✓ Done with", mask_type)

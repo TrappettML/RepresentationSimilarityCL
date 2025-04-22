@@ -26,7 +26,7 @@ def generate_loss_plots(
     switch_point: int,
     steps_after_switch: int = 500000,
     min_runs_for_std: int = 2,
-    loss_file_pattern: str = r"losses_v_(\d+\.\d+)\.npz",
+    loss_file_pattern: str = r"losses_v_(\d+\.\d+)_spars_(\d+\.\d+)\.npz",
     show_plots: bool = False, # Control whether to .show() plots internally
     verbose: bool = True # Control print statements
 ) -> Tuple[Optional[go.Figure], Optional[go.Figure]]:
@@ -369,14 +369,14 @@ if __name__ == "__main__":
     print("Running example usage of generate_loss_plots...")
 
     # Define the directory where your data lives for the example
-    EXAMPLE_DATA_DIR = "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/tests/new_switch_point/" # Adjust if needed
+    EXAMPLE_DATA_DIR = "./loss_data/tests/gating_method//d_h_200_d_hs_200_sparsity_0_g_type_Determ/" # Adjust if needed
 
     # Call the main function
     # Set show_plots=True if you want plots to display automatically here
     figure1, figure2 = generate_loss_plots(
         data_dir=EXAMPLE_DATA_DIR,
-        switch_point=1_500_000,
-        steps_after_switch=500000, # Example value
+        switch_point=1000000,
+        steps_after_switch=50000, # Example value
         show_plots=True,           # Show plots when run directly
         verbose=True               # Show log messages
     )
