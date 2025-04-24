@@ -1,6 +1,6 @@
 #!/bin/bash
 # slurm_sparse_loops.sh > sparse_params.txt
-human_date=$(date +"%a_%d_%b_%Y" | tr -d '\r')    # Human-friendly: Thu-05-Oct-2023
+human_date=$(date +"%a_%d_%b_%Y_%H%M" | tr -d '\r')    # Human-friendly: Thu-05-Oct-2023
 TALAPAS_PATH="/home/mtrappet/tau/StudentTeacher/single_layer_sparse/run_date_${human_date}/"
 
 d_hs=200
