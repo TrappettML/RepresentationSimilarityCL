@@ -334,7 +334,7 @@ if __name__ == "__main__":
     print(jax.devices())
     # --- Configuration ---
     d_in = 800
-    num_epochs = 20_000 # Total steps (will be split per task)
+    num_epochs = 3_000_000 # Total steps (will be split per task)
     switch_point = int(num_epochs/2)
     lr = 0.3 # lr is 1 for d_in=10_000, 0.1 for d_in=1_000 ### but 1 breaks
     sample_rate = 10_000 # Sample every N steps
