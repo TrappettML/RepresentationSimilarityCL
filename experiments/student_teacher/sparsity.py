@@ -13,6 +13,7 @@ from timer_class import Timer
 from loss_diff_plots import generate_loss_plots
 import sys
 from make_masks import create_masks
+from ipdb import set_trace
 
 
 # -------------------------
@@ -32,6 +33,7 @@ class StudentHead(nn.Module):
     def __call__(self, x):
         out = nn.Dense(
             1,
+            use_bias=False,
             name="head_out",
             kernel_init=scaled_normal_init(0.001),  
         )(x)
@@ -45,10 +47,9 @@ class StudentNetwork(nn.Module):
     '''
     hidden_dim: int
     head_hidden_dim: int
-    masks: tuple # a tuple for (student1,student2) masks
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, masks):
         # Backbone layer with scaled init
         x = nn.Dense(
             self.hidden_dim,
@@ -61,18 +62,26 @@ class StudentNetwork(nn.Module):
                      name="shared_head_layer",
                      kernel_init=scaled_normal_init(0.001))(x)
         
-        hidden_s1 = x*self.masks[0]
-        hidden_s2 = x*self.masks[1]
+        hidden_s1 = x*masks[0]
+        hidden_s2 = x*masks[1]
         s1_out = StudentHead(name="head1")(hidden_s1)
         s2_out = StudentHead(name="head2")(hidden_s2)
         return s1_out, s2_out
 
 # We might manage params and opt_state directly for easier vmapping
 # than the full TrainState object.
-def create_initial_state_parts(rng, model, optimizer, sample_input):
-    params = model.init(rng, sample_input)['params']
+# def create_initial_state_parts(rng, model, optimizer, sample_input):
+#     params = model.init(rng, sample_input)['params']
+#     opt_state = optimizer.init(params)
+#     return params, opt_state # Return optimizer too
+
+def create_initial_state_parts(rng, optimizer, sample_input, sparsity, g_type, v, d_hs, d_h):
+    mask_key, model_key = random.split(rng)
+    mask1, mask2, overlap = create_masks(d_in=d_hs, d_out=1, sparsity=sparsity, v=v, m_type=g_type, key=mask_key)
+    model = StudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs)
+    params = model.init(model_key, sample_input, (mask1, mask2))['params']
     opt_state = optimizer.init(params)
-    return params, opt_state # Return optimizer too
+    return params, opt_state, overlap
 
 @jit
 def teacher_forward(x, w1, w2):
@@ -85,11 +94,11 @@ def teacher_forward(x, w1, w2):
 # -------------------------
 
 # Note: train_step now focuses on grads, update happens separately
-@partial(jit, static_argnums=(4,5)) # head_idx and apply_fn are static
-def compute_grads(params, batch, teacher_w1, teacher_w2, head_idx, apply_fn):
+@partial(jit, static_argnums=(4 ,5,)) # head_idx and apply_fn are static
+def compute_grads(params, batch, teacher_w1, teacher_w2, head_idx, apply_fn, masks):
     """Computes loss and gradients for a single run's state."""
     def loss_fn(p):
-        pred1, pred2 = apply_fn({'params': p}, batch)
+        pred1, pred2 = apply_fn({'params': p}, batch, masks)
         # pred1, pred2 = jax.checkpoint(apply_fn)({'params': p}, batch)  # Rematerialization
         pred = pred1 if head_idx == 0 else pred2
         targets = teacher_forward(batch, teacher_w1, teacher_w2)
@@ -100,9 +109,9 @@ def compute_grads(params, batch, teacher_w1, teacher_w2, head_idx, apply_fn):
 
 # Evaluation step (similar, but uses vmap internally for test data)
 @partial(jit, static_argnums=(1,)) # apply_fn is static
-def evaluate_metrics(params, apply_fn, test_inputs, t1_targets, t2_targets):
+def evaluate_metrics(params, apply_fn, test_inputs, t1_targets, t2_targets, masks):
     """Computes test losses for a single run's parameters."""
-    pred1, pred2 = apply_fn({'params': params}, test_inputs)
+    pred1, pred2 = apply_fn({'params': params}, test_inputs, masks)
     # Teacher forward should handle batches if test_inputs is batched
     # targets1 = teacher_forward(test_inputs, t1_w1, t1_w2)
     # targets2 = teacher_forward(test_inputs, t2_w1, t2_w2)
@@ -116,13 +125,12 @@ def evaluate_metrics(params, apply_fn, test_inputs, t1_targets, t2_targets):
 # -------------------------
 # Make static args explicit for clarity
 @partial(jit, static_argnames=("switch_point", "sample_rate",
-                               "d_in", "batch_size",
-                               "model_apply_fn", "optimizer", 
-                               "num_epochs"))
+                               "d_in", "batch_size", "model_apply_fn", "optimizer", 
+                               "num_epochs", "sparsity", "g_type", "d_hs", "d_h", "d_out"))
 def vectorized_train_for_v(
-    initial_params_batch, # Shape (num_runs, ...) PyTree
-    initial_opt_state_batch, # Shape (num_runs, ...) PyTree
+    # initial_params_batch, # Shape (num_runs, ...) PyTree
     initial_keys_batch, # Shape (num_runs, 2)
+    master_key,
     t1_w1, t1_w2, 
     t2_w1, t2_w2, 
     switch_point, # static
@@ -135,7 +143,35 @@ def vectorized_train_for_v(
     t2_test_targets,  
     num_epochs, # static
     batch_size, # static
+    # for mask and net creation
+    sparsity,
+    similarity,
+    g_type,
+    d_hs,
+    d_h,
+    d_out
     ):
+    # create num_runs keys for masks and models, separate than batch keys (initial_keys_batch)
+    mask_master_key, model_master_key = jax.random.split(master_key)
+    mask_keys = jax.random.split(mask_master_key, num_runs)  # -> (num_runs, 2) array
+    model_keys = jax.random.split(model_master_key, num_runs)
+
+    # then vmap create_masks over that:
+    masks_batch = vmap(
+        create_masks,
+        in_axes=(None, None, None, None, None, 0),
+    )(
+        d_hs, d_out, sparsity, similarity, g_type, mask_keys
+    )
+    mask1_batch, mask2_batch, overlap_batch = masks_batch   
+    # Generate initial states inside using num_runs keys for model, model_keys
+    vmap_create_state = vmap(partial(create_initial_state_parts, optimizer=optimizer,
+                                    sample_input=jnp.ones((1, d_in)),
+                                    sparsity=sparsity, g_type=g_type, v=v,
+                                    d_hs=d_hs, d_h=d_h))
+    
+    initial_params_batch, initial_opt_state_batch, _ = vmap_create_state(model_keys)
+
 
     # batch_size = 1 # Or make it a static arg if > 1
     # Vmapped function to apply optimizer update
@@ -145,11 +181,12 @@ def vectorized_train_for_v(
         new_params = vmap(optax.apply_updates)(params_batch, updates)
         return new_params, new_opt_state
 
+    vmap_compute_grads = vmap(compute_grads, in_axes=(0, 0, None, None, None, None, (0,0)))
+    vmap_eval = vmap(evaluate_metrics, in_axes=(0, None, None, None, None, (0, 0)))
     # --- Scan Step for Task 1 ---
     def step_fn1(carry, step_idx):
         # keys batch holds the number of repeats, 5 keys = 5 repeats
         params_batch, opt_state_batch, keys_batch = carry
-
         # # 1. Generate keys and batch per run
         # TODO: Adapt if batch_size > 1
         keys_split_pairs = vmap(lambda k: random.split(k, 2))(keys_batch) # Output shape (5, 2, 2)
@@ -163,14 +200,9 @@ def vectorized_train_for_v(
         
         # 2. Compute loss and gradients (vmapped over runs)
         # Pass teacher 1 weights, head_idx 0
-        vmap_compute_grads = vmap(compute_grads, in_axes=(0, 0, None, None, None, None))
         loss_batch, grads_batch = vmap_compute_grads(params_batch, 
                                                      batch_data, 
-                                                     t1_w1, 
-                                                     t1_w2, 
-                                                     0, 
-                                                     model_apply_fn)
-
+                                                     t1_w1, t1_w2, 0, model_apply_fn, (mask1_batch, mask2_batch))
         # 3. Apply optimizer updates (vmapped over runs)
         new_params_batch, new_opt_state_batch = vmapped_optimizer_update(grads_batch, 
                                                                         opt_state_batch, 
@@ -179,9 +211,8 @@ def vectorized_train_for_v(
 
         # 4. Evaluate metrics periodically (using lax.cond)
         def eval_true():
-             vmap_eval = vmap(evaluate_metrics, in_axes=(0, None, None, None, None))
              test_loss1_batch, test_loss2_batch = vmap_eval(
-                 new_params_batch, model_apply_fn, test_inputs, t1_test_targets, t2_test_targets
+                 new_params_batch, model_apply_fn, test_inputs, t1_test_targets, t2_test_targets, (mask1_batch, mask2_batch)
              )
              return test_loss1_batch, test_loss2_batch
 
@@ -225,13 +256,13 @@ def vectorized_train_for_v(
 
         # 2. Compute loss and gradients (vmapped over runs)
         # Pass teacher 2 weights, head_idx 1
-        vmap_compute_grads = vmap(compute_grads, in_axes=(0, 0, None, None, None, None))
         loss_batch, grads_batch = vmap_compute_grads(params_batch, 
                                                      batch_data, 
                                                      t2_w1, 
                                                      t2_w2, 
                                                      1, 
-                                                     model_apply_fn)
+                                                     model_apply_fn,
+                                                    (mask1_batch, mask2_batch))
 
         # 3. Apply optimizer updates (vmapped over runs)
         new_params_batch, new_opt_state_batch = vmapped_optimizer_update(
@@ -240,9 +271,8 @@ def vectorized_train_for_v(
 
         # 4. Evaluate metrics periodically (same logic as step_fn1)
         def eval_true():
-             vmap_eval = vmap(evaluate_metrics, in_axes=(0, None, None, None, None))
              test_loss1_batch, test_loss2_batch = vmap_eval(
-                 new_params_batch, model_apply_fn, test_inputs, t1_test_targets, t2_test_targets
+                 new_params_batch, model_apply_fn, test_inputs, t1_test_targets, t2_test_targets, (mask1_batch, mask2_batch)
              )
              return test_loss1_batch, test_loss2_batch
         def eval_false():
@@ -281,7 +311,7 @@ def vectorized_train_for_v(
     sampled_test2 = all_test2[eval_indices]
 
     # sampled arrays should have shape (num_samples, num_runs)
-    return sampled_losses, sampled_test1, sampled_test2
+    return sampled_losses, sampled_test1, sampled_test2, overlap_batch
 
 # -------------------------
 # Main Execution Block
@@ -293,29 +323,30 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     arg_names = ['d_hs', 'sparsity', 'g_type', 'path']
     arg_dict = dict(zip(arg_names, args))
-    d_hs = int(arg_dict.get('d_hs', 200))
-    sparsity = float(arg_dict.get('sparsity', 0.5))
-    g_type = arg_dict.get('g_type', 'Determ')
-    parent_path = arg_dict.get('path', "/loss_data/tests/gating_method/")
-    d_h = 200
-    print(f"{arg_dict}")
+    d_hs = int(arg_dict.setdefault('d_hs', 200))
+    sparsity = float(arg_dict.setdefault('sparsity', 0.5))
+    g_type = arg_dict.setdefault('g_type', 'Determ').lower()
+    parent_path = arg_dict.setdefault('path', "/loss_data/tests/gating_method/")
+    avail_gpus = jax.devices()
+    print(jax.devices())
+    # --- Configuration ---
+    d_in = 800
+    num_epochs = 2_000_000 # Total steps (will be split per task)
+    switch_point = int(num_epochs/2)
+    lr = 0.3 # lr is 1 for d_in=10_000, 0.1 for d_in=1_000 ### but 1 breaks
+    sample_rate = 10_000 # Sample every N steps
+    v_values = np.linspace(0, 1, 11)
+    num_runs = 20
+    test_size = 50000
+    batch_size = 200
+    d_h = d_hs # make them equal
     d_out = 1
+    output_dir = f".{parent_path}/d_h_{d_h}_d_hs_{d_hs}_sparsity_{sparsity}_g_type_{g_type}_lr_{lr}/"
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"{arg_dict}")
+    
 
     with Timer(print_time=True, show_memory=False):
-        avail_gpus = jax.devices()
-        print(jax.devices())
-        # --- Configuration ---
-        d_in = 800
-        num_epochs = 2_000_000 # Total steps (will be split per task)
-        switch_point = int(num_epochs/2)
-        lr = 0.1 # lr is 1 for d_in=10_000, 0.1 for d_in=1_000 ### but 1 breaks
-        sample_rate = 10_000 # Sample every N steps
-        v_values = np.linspace(0, 1, 11)
-        num_runs = 10
-        output_dir = f".{parent_path}/d_h_{d_h}_d_hs_{d_hs}_sparsity_{sparsity}_g_type_{g_type}/"
-        os.makedirs(output_dir, exist_ok=True)
-        test_size = 50000
-        batch_size = 200
 
         # --- Master key ---
         script_master_key = random.PRNGKey(42)
@@ -346,29 +377,21 @@ if __name__ == "__main__":
         test_key, script_master_key = random.split(script_master_key)
         test_inputs = jax.random.normal(test_key, (test_size, d_in))
 
+
+        # # --- Model and Optimizer (once) ---
+        student_model = StudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs)
+        model_apply_fn = student_model.apply
+        optimizer = optax.sgd(lr) # Create optimizer instance
+
         print(f"Using {g_type}:\nSparsity: {sparsity:.2f}%\n")
         # --- Loop over similarity values ---
         for v_idx, v in enumerate(v_values):
-            # --- Create Masks ---
-            mask_key, script_master_key = random.split(script_master_key)
-            mask1, mask2, overlap = create_masks(d_in=d_hs, d_out=d_out, sparsity=sparsity, v=v, m_type=g_type, key=mask_key)
-
-            # --- Model and Optimizer (once) ---
-            student_model = StudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs, masks=(mask1, mask2))
-            sample_input = jnp.ones((1, d_in)) # For initialization shape
-            optimizer = optax.sgd(lr) # Create optimizer instance
-            
-            print(f"\n--- Starting Similarity v={v:.2f}\n{mask1=}\n{mask2=}\n{overlap=}\n({v_idx+1}/{len(v_values)}) ---")
+            # --- Prepare for vectorized run ---
+            print(f"\n--- Starting Similarity v={v:.2f} ({v_idx+1}/{len(v_values)}) ---")
 
             # --- Prepare for vectorized run ---
             v_master_key, script_master_key = random.split(script_master_key)
-            run_keys = random.split(v_master_key, num_runs) # Keys for each run's initialization
-
-            # Create vmapped initial states
-            vmap_create_state = vmap(create_initial_state_parts, in_axes=(0, None, None, None))
-            initial_params_batch, initial_opt_state_batch = vmap_create_state(
-                run_keys, student_model, optimizer, sample_input
-            )
+            run_keys = random.split(v_master_key, num_runs)
 
             # Create teacher 2 (only needs one instance per v)
             create_t2_key, _ = random.split(run_keys[0]) # Use one key just for t2 creation
@@ -379,22 +402,29 @@ if __name__ == "__main__":
             t2_test_targets = teacher_forward(test_inputs, teacher2_w1, teacher2_w2)
 
             # --- Execute the vectorized training ---
-            train_losses, test_losses1, test_losses2 = vectorized_train_for_v(
-                initial_params_batch,
-                initial_opt_state_batch,
+            train_losses, test_losses1, test_losses2, overlap = vectorized_train_for_v(
+                # initial_params_batch,
+                # initial_opt_state_batch,
                 run_keys, # Pass the run keys for generating data inside scan
+                script_master_key,
                 teacher1_w1, teacher1_w2,
                 teacher2_w1, teacher2_w2,
                 switch_point,
                 d_in,
                 sample_rate,
-                student_model.apply, # Pass the apply fn
-                optimizer,           # Pass the optimizer
+                model_apply_fn,
+                optimizer,      
                 test_inputs,
                 t1_test_targets,
                 t2_test_targets,
                 num_epochs,
-                batch_size
+                batch_size,
+                sparsity,
+                v,
+                g_type,
+                d_hs,
+                d_h,
+                d_out
             )
             # train_losses etc have shape (num_samples, num_runs)
 
@@ -407,13 +437,18 @@ if __name__ == "__main__":
                 "test_loss1": np.array(test_losses1),
                 "test_loss2": np.array(test_losses2),
                 "epochs": epochs_array[:num_samples], # Ensure epochs match samples dim
-                "mask1": mask1,
-                "mask2": mask2,
+                "num_epochs": num_epochs,
                 "overlap": overlap,
+                "switch_point": switch_point,
+                "lr": lr,
+                "sparsity": sparsity,
+                "d_hs": d_hs,
+                "d_in": d_in,
+                "g_type": g_type,
             }
 
             # --- Save the aggregated results ---
-            filename = os.path.join(output_dir, f"losses_v_{v:.2f}_spars_{sparsity:.2f}.npz")
+            filename = os.path.join(output_dir, f"g_type_{g_type}_v_{v:.2f}_spars_{sparsity:.2f}.npz")
             np.savez(filename, **final_results_for_v)
             print(f"Results Saved for v={v:.2f} (Shape e.g., train_loss: {final_results_for_v['train_loss'].shape})")
 

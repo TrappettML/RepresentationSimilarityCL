@@ -369,7 +369,7 @@ if __name__ == "__main__":
     print("Running example usage of generate_loss_plots...")
 
     # Define the directory where your data lives for the example
-    EXAMPLE_DATA_DIR = "./loss_data/tests/gating_method//d_h_200_d_hs_200_sparsity_0_g_type_Determ/" # Adjust if needed
+    EXAMPLE_DATA_DIR = "./loss_data/tests/gating_method//d_h_200_d_hs_200_sparsity_0.7_g_type_determ/" # Adjust if needed
 
     # Call the main function
     # Set show_plots=True if you want plots to display automatically here

@@ -20,4 +20,4 @@
 source /home/mtrappet/BranchGating/data-science/bin/activate
 params=$(sed -n "${SLURM_ARRAY_TASK_ID}p" params.txt)
 
-python ../experiments/FuturesLongLearning.py $params
+python .experiments/student_teacher/sparsity $params
