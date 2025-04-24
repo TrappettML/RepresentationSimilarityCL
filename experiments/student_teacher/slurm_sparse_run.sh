@@ -16,7 +16,7 @@
 #SBATCH --mail-user=mtrappet@uoregon.edu
 
 module load cuda/12.4.1
-source /home/mtrappet/BranchGating/data-science/bin/activate
+source /home/mtrappet/stu_teach/RepresentationSimilarityCL/rspy/bin/activate
 params=$(sed -n "${SLURM_ARRAY_TASK_ID}p" sparse_params.txt)
 
 python /home/mtrappet/stu_teach/RepresentationSimilarityCL/experiments/student_teacher/sparsity.py $params
