@@ -46,6 +46,31 @@ x = jax.random.normal(key, (1000, 1000))
 y = jax.numpy.dot(x, x.T)
 print(f"Matrix multiplication result sum: {y.sum():.2f}")
 print("All GPU tests completed successfully!")
+
+# --- GPU Spec Reporting ---
+print("\n=== JAX Device Info ===")
+devices = jax.devices()
+for idx, device in enumerate(devices):
+    print(f"Device {idx}:")
+    print(f"  Platform: {device.platform}")
+    print(f"  Device Type: {device.device_kind}")
+    print(f"  Memory: {device.client.device_memory_info().total / 1e9:.2f} GB (Total)")
+    print(f"  Process Memory: {device.client.memory_usage() / 1e9:.2f} GB (Used)")
+
+# --- Alternative: System-Level Info ---
+try:
+    import pynvml
+    print("\n=== System GPU Info ===")
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    print(f"GPU Name: {pynvml.nvmlDeviceGetName(handle)}")
+    print(f"Total Memory: {mem_info.total/1e9:.2f} GB")
+    print(f"Free Memory: {mem_info.free/1e9:.2f} GB")
+    print(f"Used Memory: {mem_info.used/1e9:.2f} GB")
+except ImportError:
+    print("\nInstall pynvml for detailed system GPU info: pip install pynvml")
+
 EOF
 
 deactivate
