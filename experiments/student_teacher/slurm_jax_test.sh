@@ -2,12 +2,12 @@
 #SBATCH --job-name=jax_gpu_test
 #SBATCH --output=jax_test_%j.out
 #SBATCH --error=jax_test_%j.err
-#SBATCH --partition=gpu-80gb  # Change to your GPU partition name
+#SBATCH --partition=gpu,gpulong  # Change to your GPU partition name
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus=1         # Request 1 GPU
 #SBATCH --time=00:30:00  # 30 minute test
-#SBATCH --mem=8G
+#SBATCH --mem=70G
 #SBATCH --account=tau  ### Account used for job submission
 
 # Load required modules (adjust for your cluster)
