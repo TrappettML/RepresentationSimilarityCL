@@ -309,7 +309,7 @@ def vectorized_train_for_v(
     sampled_losses = all_losses[eval_indices]
     sampled_test1 = all_test1[eval_indices]
     sampled_test2 = all_test2[eval_indices]
-
+    
     # sampled arrays should have shape (num_samples, num_runs)
     return sampled_losses, sampled_test1, sampled_test2, overlap_batch
 
@@ -331,7 +331,7 @@ if __name__ == "__main__":
     print(jax.devices())
     # --- Configuration ---
     d_in = 800
-    num_epochs = 2_000_000 # Total steps (will be split per task)
+    num_epochs = 20_000 # Total steps (will be split per task)
     switch_point = int(num_epochs/2)
     lr = 0.3 # lr is 1 for d_in=10_000, 0.1 for d_in=1_000 ### but 1 breaks
     sample_rate = 10_000 # Sample every N steps
