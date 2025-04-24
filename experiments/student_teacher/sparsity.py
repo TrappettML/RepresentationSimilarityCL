@@ -14,6 +14,7 @@ from loss_diff_plots import generate_loss_plots
 import sys
 from make_masks import create_masks
 from ipdb import set_trace
+import argparse
 
 
 # -------------------------
@@ -309,7 +310,7 @@ def vectorized_train_for_v(
     sampled_losses = all_losses[eval_indices]
     sampled_test1 = all_test1[eval_indices]
     sampled_test2 = all_test2[eval_indices]
-    
+
     # sampled arrays should have shape (num_samples, num_runs)
     return sampled_losses, sampled_test1, sampled_test2, overlap_batch
 
@@ -320,6 +321,8 @@ if __name__ == "__main__":
     '''example function call from commandline:
     python ~/mtrl/experiments/student_teacher/sparsity.py d_hs sparsity overlap g_type path
     '''
+    # p = argparse.ArgumentParser(description="Run StudentTeacher Single Layer Experiment")
+    # p.add_argument("d_hs", default=200, help="size of hidden dimensions")
     args = sys.argv[1:]
     arg_names = ['d_hs', 'sparsity', 'g_type', 'path']
     arg_dict = dict(zip(arg_names, args))
