@@ -11,15 +11,15 @@ def random_gates(r_key, s, d_in, d_out, n_vectors):
     return jax.vmap(lambda k: jax.random.bernoulli(k, s, (d_in, d_out)))(random_keys).squeeze(-1).astype(jnp.float32)
 
 def deterministic_gates(key, v, s, d_in, d_out, n_vectors):
-    h = v + 0.4 * jnp.pi
+    h = v + 1.3 # + 0.4 * jnp.pi
     theta = jnp.array([jnp.cos(h*jnp.pi), jnp.sin(h*jnp.pi)])
     determ_keys = jax.random.split(key, n_vectors*2)
-
+    # print(f"{theta.shape=}") # equals (2,)
     base = jax.vmap(lambda k: jax.random.uniform(k, (d_in, d_out)))(determ_keys)
     base = jnp.reshape(base, (n_vectors, d_in, d_out, 2))
-    # print(f"{base.shape=}")
-    z = base @ theta.T
-    # print(f"{z.shape=}")
+    # print(f"{base.shape=}") # = (50, 100, 1, 2)
+    z = base @ theta
+    # print(f"{z.shape=}") # = (50, 100, 1)
     ones = jnp.ones_like(z)
     g_determ = jnp.heaviside(z - (s-0.5), ones)
     # print(f"{base.shape=}")
