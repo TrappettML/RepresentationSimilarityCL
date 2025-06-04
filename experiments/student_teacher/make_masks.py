@@ -4,24 +4,52 @@ from typing import Tuple
 from ipdb import set_trace
 
 
-def random_gates(r_key, s, d_in, d_out, n_vectors):
+def random_gates(r_key, s: float, d_in: int, n_vectors: int):
     d_in = int(d_in)
-    d_out = int(d_out)
     random_keys = jax.random.split(r_key, n_vectors)
-    return jax.vmap(lambda k: jax.random.bernoulli(k, s, (d_in, d_out)))(random_keys).squeeze(-1).astype(jnp.float32)
+    return jax.vmap(lambda k: jax.random.bernoulli(k, 1-s, (d_in)))(random_keys).astype(jnp.float32)
 
-def deterministic_gates(key, v, s, d_in, d_out, n_vectors):
-    h = v + 1.3 # + 0.4 * jnp.pi
+def deterministic_gates2(key, v, s, d_in, n_vectors):
+    ''' ============== type 1 =============='''
+    # b1_key, b2_key = jax.random.split(key, 2)
+    # determ_keys = jax.random.split(b1_key, n_vectors)
+    # pi = jnp.clip((0.5*jnp.tanh(b*((1-s)-m))+0.5), min=0.01, max=1)
+    # g_1 = jax.vmap(lambda k: jax.random.bernoulli(k, 1-pi, (d_in)))(determ_keys).astype(jnp.float32)
+    # determ_keys2 = jax.random.split(b2_key, n_vectors)
+    # g_2 = jax.vmap(lambda k: jax.random.bernoulli(k, 1-pi, (d_in)))(determ_keys2).astype(jnp.float32)
+    ''' ============== type 2 =============='''
+    b = 5
+    m = 0.5
+    pi = (1-s)
+    key1, key2 = jax.random.split(key, 2)
+    determ_keys = jax.random.split(key1, n_vectors)
+    g_1 = jax.vmap(lambda k: jax.random.bernoulli(k, pi, (d_in)))(determ_keys).astype(jnp.float32)
+    not_g1 = 1 - g_1 # will be 1's where g_1 had zeros, use for p0
+    u = jnp.clip((0.5*jnp.tanh(b*(v-m))+0.5), min=0.05, max=1.0)
+    # u = jnp.clip((4*(v-0.5)**2), min=0.05, max=1.0)
+    p1 = g_1 * u
+    p0 = not_g1 * jnp.clip(((1 - s)/(s+1e-12)) * (1 - u), min=0.0, max=1.0)
+    p0 = not_g1 * (1-u)
+    P = p1 + p0 # should be same shape as g_1
+    g2_key, key = jax.random.split(key2)
+    g_2 = jax.random.bernoulli(g2_key, P, (g_1.shape)).astype(jnp.float32)
+    return g_1, g_2
+
+def deterministic_gates(key, v, s, d_in, n_vectors):
+    o = 0.4 * jnp.pi # 1.3 before
+    h = v + o # + 0.4 * jnp.pi
     theta = jnp.array([jnp.cos(h*jnp.pi), jnp.sin(h*jnp.pi)])
     determ_keys = jax.random.split(key, n_vectors*2)
     # print(f"{theta.shape=}") # equals (2,)
-    base = jax.vmap(lambda k: jax.random.uniform(k, (d_in, d_out)))(determ_keys)
-    base = jnp.reshape(base, (n_vectors, d_in, d_out, 2))
+    base = jax.vmap(lambda k: jax.random.uniform(k, (d_in)))(determ_keys)
+    base = jnp.reshape(base, (n_vectors, d_in, 2))
     # print(f"{base.shape=}") # = (50, 100, 1, 2)
     z = base @ theta
     # print(f"{z.shape=}") # = (50, 100, 1)
     ones = jnp.ones_like(z)
-    g_determ = jnp.heaviside(z - (s-0.5), ones)
+    m = 0
+    g_determ = jnp.heaviside(z - (s-m), ones)
+
     # print(f"{base.shape=}")
     #####
     # m = 10
@@ -30,11 +58,10 @@ def deterministic_gates(key, v, s, d_in, d_out, n_vectors):
     # s = s-0.01
     # g_determ = (z_sigmoid > s).astype(jnp.float32)
     #######
-    return g_determ.squeeze(-1).astype(jnp.float32)
+    return g_determ.astype(jnp.float32)
     
 
 def create_masks(d_in: int,
-                  d_out: int,
                   sparsity: float,
                   v: float, # task similarity; 0: orthog, 1: same
                   m_type: str, # determ or random
@@ -42,14 +69,17 @@ def create_masks(d_in: int,
     masks = None
     m_type = m_type.lower()
     if m_type=='random':
-        masks = random_gates(key, sparsity, d_in, d_out, 2) # get two repeats to return each mask
+        masks = random_gates(key, sparsity, d_in, 2) # get two repeats to return each mask
+        mask1 = masks[0, :]
+        mask2 = masks[1, :]
     elif m_type=='determ':
-        masks = deterministic_gates(key, v, sparsity, d_in, d_out, 2)
+        # masks = deterministic_gates(key, v, sparsity, d_in, 2)
+        mask1, mask2 = deterministic_gates2(key, v, sparsity, d_in, 1)
+    # set_trace()
 
-    assert masks != None, f"type not possible, got {m_type=}, should be either 'determ' or 'random'."
-    mask1 = masks[0, :]
-    mask2 = masks[1, :]
-    overlap = jnp.sum(jnp.multiply(mask1, mask2), axis=-1)/d_in
+    assert mask1 != None, f"type not possible, got {m_type=}, should be either 'determ' or 'random'."
+
+    overlap = jnp.sum(jnp.multiply(mask1, mask2), axis=-1)/jnp.sum(mask1)
     return mask1, mask2, overlap
 
 
@@ -134,10 +164,9 @@ if __name__ == "__main__":
                 subkey = jax.random.fold_in(key, rep)
                 mask1, mask2, ovlp = create_masks(
                     d_in=d_hs,
-                    d_out=1,
                     sparsity=sparsity,
                     v=v_param,
-                    type=mask_type,
+                    m_type=mask_type,
                     key=subkey
                 )
                 overlaps.append(float(ovlp))

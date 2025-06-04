@@ -1,3 +1,7 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
 import jax
 import jax.numpy as jnp
 from jax import random, jit, vmap, lax
@@ -6,16 +10,71 @@ from flax import linen as nn
 import flax
 from flax.training import train_state
 import numpy as np
-import os
 from functools import partial
 from jax.scipy.special import erf
 from timer_class import Timer
-from loss_diff_plots import generate_loss_plots
 import sys
 from make_masks import create_masks
 from ipdb import set_trace
 import argparse
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+import pickle
+from loss_plotter import save_param_hist
 
+# Optional: Explicit device selection
+devices = jax.devices('gpu')
+if len(devices) >= 3:
+    jax.config.update('jax_default_device', devices[2])
+
+avail_gpus = jax.devices()
+print("Available devices:", avail_gpus) 
+
+def plot_loss(npz_path: str | Path,
+              head: int = 1,
+              log_y: bool = True,
+              dpi: int = 150) -> tuple:
+    """
+    Parameters
+    ----------
+    npz_path : str | Path
+        Path to the results file produced by sparsity.py.
+    head : {1, 2}
+        Which test‑head loss to display (test_loss1 or test_loss2).
+    log_y : bool
+        Use a log‑scaled y‑axis if True.
+    dpi : int
+        Resolution of the saved PNG.
+
+    Returns
+    -------
+    fig, ax : Matplotlib figure and axis objects (for further tweaking).
+    """
+    npz_path = Path(npz_path)
+    data     = np.load(npz_path)
+
+    epochs     = data["epochs"]                          # (num_samples,)
+    train_loss = data["train_loss"].mean(axis=1)         # (num_samples,)
+    test_loss  = data[f"test_loss{head}"].mean(axis=1)   # (num_samples,)
+
+    fig, ax = plt.subplots()
+    ax.plot(epochs, train_loss, label="train loss")
+    ax.plot(epochs, test_loss,  label=f"test loss (head {head})")
+
+    ax.set_xlabel("training step")
+    ax.set_ylabel("MSE")
+    if log_y:
+        ax.set_yscale("log")
+    ax.set_title(npz_path.stem)
+    ax.legend()
+
+    # --- automatic file name -------------------------------------------------
+    out_png = npz_path.with_name(f"{npz_path.stem}_head{head}_loss.png")
+    fig.savefig(out_png, dpi=dpi, bbox_inches="tight")
+    print(f"Saved figure → {out_png.resolve()}")
+
+    return fig, ax
 
 # -------------------------
 # Model/Helper Definitions (keep as before)
@@ -36,7 +95,8 @@ class StudentHead(nn.Module):
             1,
             use_bias=False,
             name="head_out",
-            kernel_init=scaled_normal_init(0.001),  
+            kernel_init=scaled_normal_init(1 / jnp.sqrt(x.shape[-1])),  
+            # kernel_init=scaled_normal_init(0.001),
         )(x)
         return out
 
@@ -49,46 +109,49 @@ class StudentNetwork(nn.Module):
     hidden_dim: int
     head_hidden_dim: int
 
+    def setup(self):
+        self.head_layer = StudentHead(name="head1")
+
     @nn.compact
     def __call__(self, x, masks):
         # Backbone layer with scaled init
-        x = nn.Dense(
-            self.hidden_dim,
-            use_bias=False,
-            name="backbone_dense",
-            kernel_init=scaled_normal_init(0.001),
-            )(x) / jnp.sqrt(x.shape[-1])  # Keep normalization as-is
-        x = scaled_error(x)
-        x = nn.Dense(self.head_hidden_dim, use_bias=False,
-                     name="shared_head_layer",
-                     kernel_init=scaled_normal_init(0.001))(x)
+        # remove shared layer
+        # x =  nn.Dense(
+        #     self.hidden_dim,
+        #     use_bias=False,
+        #     name="backbone_dense",
+        #     kernel_init=scaled_normal_init(1),
+        #     )(x) # / jnp.sqrt(x.shape[-1])  # Keep normalization as-is
+        # # x = scaled_error(x)
         
-        hidden_s1 = x*masks[0]
-        hidden_s2 = x*masks[1]
-        s1_out = StudentHead(name="head1")(hidden_s1)
-        s2_out = StudentHead(name="head2")(hidden_s2)
+        x = nn.Dense(self.head_hidden_dim, use_bias=False,
+                     name="masked_layer",
+                     kernel_init=scaled_normal_init(jnp.sqrt(2 / x.shape[-1]))
+                    # kernel_init=scaled_normal_init(0.001),
+                     )(x)
+        x = nn.relu(x)
+        hidden_s1 = x*masks[0] 
+        hidden_s1 /= jnp.sqrt(masks[0].sum()) # normalize based on n active units
+        hidden_s2 = x*masks[1]  
+        hidden_s2 /= jnp.sqrt(masks[1].sum()) # normalize based on n active units
+        s1_out = self.head_layer(hidden_s1)
+        s2_out = self.head_layer(hidden_s2) # share the final head weight, single output because of single regression.
         return s1_out, s2_out
 
-# We might manage params and opt_state directly for easier vmapping
-# than the full TrainState object.
-# def create_initial_state_parts(rng, model, optimizer, sample_input):
-#     params = model.init(rng, sample_input)['params']
-#     opt_state = optimizer.init(params)
-#     return params, opt_state # Return optimizer too
-
-def create_initial_state_parts(rng, optimizer, sample_input, sparsity, g_type, v, d_hs, d_h):
-    mask_key, model_key = random.split(rng)
-    mask1, mask2, overlap = create_masks(d_in=d_hs, d_out=1, sparsity=sparsity, v=v, m_type=g_type, key=mask_key)
-    model = StudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs)
-    params = model.init(model_key, sample_input, (mask1, mask2))['params']
-    opt_state = optimizer.init(params)
-    return params, opt_state, overlap
+def create_initial_state_parts(rng, mask_pair,  *, optimizer, sample_input, d_hs, d_h):
+    # rng is the *model* key now – no split needed
+    params = StudentNetwork(hidden_dim=d_h,
+                            head_hidden_dim=d_hs).init(
+                rng, sample_input, mask_pair
+             )['params']
+    return params, optimizer.init(params)
 
 @jit
 def teacher_forward(x, w1, w2):
     # Ensure d_in is available or shape is correctly inferred
-    h = jnp.dot(x, w1) / jnp.sqrt(x.shape[-1])
-    return jnp.dot(scaled_error(h), w2)
+    h = jnp.dot(x, w1) # / jnp.sqrt(x.shape[-1])
+    # return jnp.dot(scaled_error(h), w2)
+    return jnp.dot(nn.relu(h), w2)
 
 # -------------------------
 # Vectorized Training Step Components
@@ -98,6 +161,7 @@ def teacher_forward(x, w1, w2):
 @partial(jit, static_argnums=(4 ,5,)) # head_idx and apply_fn are static
 def compute_grads(params, batch, teacher_w1, teacher_w2, head_idx, apply_fn, masks):
     """Computes loss and gradients for a single run's state."""
+    l2_reg = 0.01
     def loss_fn(p):
         pred1, pred2 = apply_fn({'params': p}, batch, masks)
         # pred1, pred2 = jax.checkpoint(apply_fn)({'params': p}, batch)  # Rematerialization
@@ -113,13 +177,9 @@ def compute_grads(params, batch, teacher_w1, teacher_w2, head_idx, apply_fn, mas
 def evaluate_metrics(params, apply_fn, test_inputs, t1_targets, t2_targets, masks):
     """Computes test losses for a single run's parameters."""
     pred1, pred2 = apply_fn({'params': params}, test_inputs, masks)
-    # Teacher forward should handle batches if test_inputs is batched
-    # targets1 = teacher_forward(test_inputs, t1_w1, t1_w2)
-    # targets2 = teacher_forward(test_inputs, t2_w1, t2_w2)
     loss1 = jnp.mean((pred1 - t1_targets)**2)
     loss2 = jnp.mean((pred2 - t2_targets)**2)
     return loss1, loss2
-
 
 # -------------------------
 # Vectorized Main Training Loop (using lax.scan)
@@ -127,7 +187,7 @@ def evaluate_metrics(params, apply_fn, test_inputs, t1_targets, t2_targets, mask
 # Make static args explicit for clarity
 @partial(jit, static_argnames=("switch_point", "sample_rate",
                                "d_in", "batch_size", "model_apply_fn", "optimizer", 
-                               "num_epochs", "sparsity", "g_type", "d_hs", "d_h", "d_out"))
+                               "num_epochs", "sparsity", "g_type", "d_hs", "d_h", "num_runs", "d_out"))
 def vectorized_train_for_v(
     # initial_params_batch, # Shape (num_runs, ...) PyTree
     initial_keys_batch, # Shape (num_runs, 2)
@@ -150,6 +210,7 @@ def vectorized_train_for_v(
     g_type,
     d_hs,
     d_h,
+    num_runs,
     d_out
     ):
     # create num_runs keys for masks and models, separate than batch keys (initial_keys_batch)
@@ -160,20 +221,36 @@ def vectorized_train_for_v(
     # then vmap create_masks over that:
     masks_batch = vmap(
         create_masks,
-        in_axes=(None, None, None, None, None, 0),
+        in_axes=(None, None, None, None, 0),
     )(
-        d_hs, d_out, sparsity, similarity, g_type, mask_keys
+        d_hs, sparsity, similarity, g_type, mask_keys
     )
-    mask1_batch, mask2_batch, overlap_batch = masks_batch   
-    # Generate initial states inside using num_runs keys for model, model_keys
-    vmap_create_state = vmap(partial(create_initial_state_parts, optimizer=optimizer,
-                                    sample_input=jnp.ones((1, d_in)),
-                                    sparsity=sparsity, g_type=g_type, v=v,
-                                    d_hs=d_hs, d_h=d_h))
+    mask1_batch, mask2_batch, overlap_batch = masks_batch 
+    # temporarily setting masks to ones for testing convergence
+    # mask1_batch, mask2_batch = (jnp.ones_like(mask1_batch), jnp.ones_like(mask2_batch))
+    if g_type == 'determ':
+        mask1_batch, mask2_batch = mask1_batch.squeeze(axis=1), mask2_batch.squeeze(axis=1)  
+    # # Generate initial states inside using num_runs keys for model, model_keys
+    # vmap_create_state = vmap(partial(create_initial_state_parts, optimizer=optimizer,
+    #                                 sample_input=jnp.ones((1, d_in)),
+    #                                 sparsity=sparsity, g_type=g_type, v=v,
+    #                                 d_hs=d_hs, d_h=d_h))
     
-    initial_params_batch, initial_opt_state_batch, _ = vmap_create_state(model_keys)
+    # initial_params_batch, initial_opt_state_batch, _ = vmap_create_state(model_keys)
+    vmap_create_state = vmap(
+                            partial(create_initial_state_parts,
+                                    optimizer=optimizer,
+                                    sample_input=jnp.ones((1, d_in)),
+                                    d_hs=d_hs, d_h=d_h),
+                            in_axes=(0, (0, 0))        # model_key, (mask1, mask2)
+                            )
+    initial_params_batch, initial_opt_state_batch = vmap_create_state(model_keys, (mask1_batch, mask2_batch))
+    initial_params_np = initial_params_batch
 
-
+    # After initialization:
+    # jax.debug.print(jnp.all(mask1_batch[0] == mask1_batch[1]))  # Should be False
+    # jax.debug.print(jnp.all(initial_params_batch['backbone_dense']['kernel'][0] == 
+    #             initial_params_batch['backbone_dense']['kernel'][1]))  # Should be False   
     # batch_size = 1 # Or make it a static arg if > 1
     # Vmapped function to apply optimizer update
     @jit
@@ -182,22 +259,25 @@ def vectorized_train_for_v(
         new_params = vmap(optax.apply_updates)(params_batch, updates)
         return new_params, new_opt_state
 
-    vmap_compute_grads = vmap(compute_grads, in_axes=(0, 0, None, None, None, None, (0,0)))
-    vmap_eval = vmap(evaluate_metrics, in_axes=(0, None, None, None, None, (0, 0)))
+    vmap_compute_grads = vmap(compute_grads, in_axes=(0, 0, 0, 0, None, None, (0,0)))
+    vmap_eval = vmap(evaluate_metrics, in_axes=(0, None, 0, 0, 0, (0, 0)))
+
+    # helper used in both step_fn1 / step_fn2
+    def _next_batch(keys_batch):
+        # keys_batch: (R, 2)  ‑‑ R == num_runs
+        split_keys = jax.vmap(lambda k: random.split(k, 2))(keys_batch)   # (R, 2, 2)
+        new_keys = split_keys[:, 0, :]   # carry forward
+        subkeys  = split_keys[:, 1, :]   # use for this minibatch
+        # produces (R, batch_size, d_in)
+        batch = vmap(lambda k: random.normal(k, (batch_size, d_in)))(subkeys)
+        return new_keys, batch
+        
+    
     # --- Scan Step for Task 1 ---
     def step_fn1(carry, step_idx):
         # keys batch holds the number of repeats, 5 keys = 5 repeats
         params_batch, opt_state_batch, keys_batch = carry
-        # # 1. Generate keys and batch per run
-        # TODO: Adapt if batch_size > 1
-        keys_split_pairs = vmap(lambda k: random.split(k, 2))(keys_batch) # Output shape (5, 2, 2)
-        # Use one key from the pair for this iteration's randomness
-        iter_keys = keys_split_pairs[:, 0, :]      # Shape (5, 2)
-        # Use the other key from the pair to carry forward
-        new_keys_batch = keys_split_pairs[:, 1, :] # Shape (5, 2)
-        # batch_data = vmap(lambda k: random.normal(k, (batch_size, d_in)))(iter_keys)
-        shape = (int(batch_size), int(d_in))
-        batch_data = vmap(lambda k: random.normal(k, shape))(iter_keys)
+        new_keys_batch, batch_data = _next_batch(keys_batch)
         
         # 2. Compute loss and gradients (vmapped over runs)
         # Pass teacher 1 weights, head_idx 0
@@ -219,7 +299,7 @@ def vectorized_train_for_v(
 
         def eval_false():
             # Return NaNs or 0s when not evaluating
-            dummy_shape = (initial_params_batch['backbone_dense']['kernel'].shape[0],) # num_runs
+            dummy_shape = (initial_params_batch['masked_layer']['kernel'].shape[0],) # num_runs
             return jnp.full(dummy_shape, jnp.nan), jnp.full(dummy_shape, jnp.nan)
 
         test_loss1_batch, test_loss2_batch = lax.cond((step_idx % sample_rate == 0),
@@ -236,23 +316,13 @@ def vectorized_train_for_v(
     (final_params_1, final_opt_state_1, final_keys_1), outputs1 = lax.scan(
         step_fn1, carry_init_1, jnp.arange(switch_point)
     )
-    # outputs1 = (all_losses_1, all_test1_1, all_test2_1)
-    # Shape: (switch_point, num_runs) for each
+    intermediate_params_np = final_params_1
 
     # --- Scan Step for Task 2 ---
     def step_fn2(carry, step_idx):
         # Use final state from task 1 as starting point
         params_batch, opt_state_batch, keys_batch = carry
-
-        # 1. Generate keys and batch per run
-        keys_split_pairs = vmap(lambda k: random.split(k, 2))(keys_batch) # Output shape (5, 2, 2)
-        # Use one key from the pair for this iteration's randomness
-        iter_keys = keys_split_pairs[:, 0, :]      # Shape (5, 2)
-        # Use the other key from the pair to carry forward
-        new_keys_batch = keys_split_pairs[:, 1, :] # Shape (5, 2)
-        # batch_data = vmap(lambda k: random.normal(k, (batch_size, d_in)))(iter_keys)
-        shape = (int(batch_size), int(d_in))
-        batch_data = vmap(lambda k: random.normal(k, shape))(iter_keys)
+        new_keys_batch, batch_data = _next_batch(keys_batch)
 
 
         # 2. Compute loss and gradients (vmapped over runs)
@@ -277,12 +347,11 @@ def vectorized_train_for_v(
              )
              return test_loss1_batch, test_loss2_batch
         def eval_false():
-             dummy_shape = (initial_params_batch['backbone_dense']['kernel'].shape[0],) # num_runs
+             dummy_shape = (initial_params_batch['masked_layer']['kernel'].shape[0],) # num_runs
              return jnp.full(dummy_shape, jnp.nan), jnp.full(dummy_shape, jnp.nan)
         test_loss1_batch, test_loss2_batch = lax.cond(
             (step_idx % sample_rate == 0), eval_true, eval_false
         )
-
 
         new_carry = (new_params_batch, new_opt_state_batch, new_keys_batch)
         outputs = (loss_batch, test_loss1_batch, test_loss2_batch)
@@ -293,8 +362,8 @@ def vectorized_train_for_v(
     (final_params_2, _, _), outputs2 = lax.scan(
         step_fn2, carry_init_2, jnp.arange(int(num_epochs - switch_point))
     )
-    # outputs2 = (all_losses_2, all_test1_2, all_test2_2)
     # Shape: (num_epochs_per_task, num_runs) for each
+    final_params_np = final_params_2
 
     # --- Combine and Sample Results ---
     all_losses = jnp.concatenate([outputs1[0], outputs2[0]], axis=0)
@@ -311,8 +380,14 @@ def vectorized_train_for_v(
     sampled_test1 = all_test1[eval_indices]
     sampled_test2 = all_test2[eval_indices]
 
+    # drift
+    dW = final_params_2['head1']['head_out']['kernel'] - initial_params_batch['head1']['head_out']['kernel']
+    drift_per_row = jnp.linalg.norm(dW, axis=1)
+
     # sampled arrays should have shape (num_samples, num_runs)
-    return sampled_losses, sampled_test1, sampled_test2, overlap_batch
+    return sampled_losses, sampled_test1, sampled_test2, overlap_batch, (mask1_batch, mask2_batch), drift_per_row, {"initial_params": initial_params_np,
+                                                                                                                    "intermediate_params": intermediate_params_np,
+                                                                                                                    "final_params": final_params_np}
 
 # -------------------------
 # Main Execution Block
@@ -326,7 +401,7 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     arg_names = ['d_hs', 'sparsity', 'g_type', 'path']
     arg_dict = dict(zip(arg_names, args))
-    d_hs = int(arg_dict.setdefault('d_hs', 200))
+    d_hs = int(arg_dict.setdefault('d_hs', int(200)))
     sparsity = float(arg_dict.setdefault('sparsity', 0.5))
     g_type = arg_dict.setdefault('g_type', 'Determ').lower()
     parent_path = arg_dict.setdefault('path', "/loss_data/tests/gating_method/")
@@ -334,17 +409,18 @@ if __name__ == "__main__":
     print(jax.devices())
     # --- Configuration ---
     d_in = 800
-    num_epochs = 3_000_000 # Total steps (will be split per task)
+    num_epochs = 500_000 # Total steps (will be split per task)
     switch_point = int(num_epochs/2)
-    lr = 0.3 # lr is 1 for d_in=10_000, 0.1 for d_in=1_000 ### but 1 breaks
+    lr = 0.1 # lr is 1 for d_in=10_000, 0.1 for d_in=1_000 ### but 1 breaks
     sample_rate = 10_000 # Sample every N steps
     v_values = np.linspace(0, 1, 11)
-    num_runs = 20
+    num_runs = 15
     test_size = 50000
-    batch_size = 200
-    d_h = d_hs # make them equal
+    batch_size = 200 # make larger than input size for better generalization
+    d_h = d_hs # make them equal # now there is no shared hidden layer
+    d_ht = int((d_hs*sparsity)/2) # teacher hidden layer size = sparse units divided by #tasks
     d_out = 1
-    output_dir = f".{parent_path}/d_h_{d_h}_d_hs_{d_hs}_sparsity_{sparsity}_g_type_{g_type}_lr_{lr}/"
+    output_dir = f"{parent_path}/d_h_{d_h}_d_hs_{d_hs}_sparsity_{sparsity}_g_type_{g_type}_lr_{lr}/"
     os.makedirs(output_dir, exist_ok=True)
     print(f"{arg_dict}")
     
@@ -355,31 +431,44 @@ if __name__ == "__main__":
         script_master_key = random.PRNGKey(42)
 
         # --- Teacher 1 ---
-        t1_key, script_master_key = random.split(script_master_key)
-        t1_w1_key, t1_w2_key = random.split(t1_key)
-        teacher1_w1 = random.normal(t1_w1_key, (d_in, 1))
-        teacher1_w1 = teacher1_w1 / (jnp.linalg.norm(teacher1_w1, axis=0, keepdims=True) + 1e-8)
-        teacher1_w2 = random.normal(t1_w2_key, (1, 1))
-        teacher1_w2 = teacher1_w2 / (jnp.linalg.norm(teacher1_w2, axis=0, keepdims=True) + 1e-8)
+        t1_key_base, t2_key_base, script_master_key = random.split(script_master_key, 3)
+        # t1_w1_key, t1_w2_key = random.split(t1_key)
+        t1_keys = random.split(t1_key_base, num_runs)
+        t_w2_key, script_master_key = random.split(script_master_key)
+        t_w2_batch = random.normal(t_w2_key, (num_runs, d_ht, d_out))
+        t_w2_batch /= jnp.linalg.norm(t_w2_batch, axis=1, keepdims=True) + 1e-8
 
-        # --- Teacher 2 Creation Function ---
-        # (Keep your create_teacher2 function, ensure it handles norms robustly)
-        def create_teacher2(v, key):
-            key, subkey, w2_key = random.split(key, 3)
-            random_vec = random.normal(subkey, (d_in, 1))
-            proj = (teacher1_w1.T @ random_vec) * teacher1_w1
-            ortho = random_vec - proj
-            ortho = ortho / (jnp.linalg.norm(ortho, axis=0, keepdims=True) + 1e-8)
-            teacher2_w1 = v * teacher1_w1 + jnp.sqrt(jnp.maximum(1 - v**2, 0.0)) * ortho # Ensure sqrt >= 0
-            teacher2_w1 = teacher2_w1 / (jnp.linalg.norm(teacher2_w1, axis=0, keepdims=True) + 1e-8)
-            teacher2_w2 = random.normal(w2_key, (1, 1))
-            teacher2_w2 = teacher2_w2 / (jnp.linalg.norm(teacher2_w2, axis=0, keepdims=True) + 1e-8)
-            return teacher2_w1, teacher2_w2
+
+        @partial(jax.jit, static_argnames=('dim'))
+        def generate_t1_single_ortho(key, dim):
+            t_key, r_key = random.split(key)
+            t = random.normal(t_key, (dim,))
+            t /= jnp.linalg.norm(t) + 1e-8
+            r = random.normal(r_key, (dim,))
+            proj_r_on_t = (r@t)/(t@t) * t
+            ortho_to_t = r - proj_r_on_t
+            ortho_to_t /= jnp.linalg.norm(ortho_to_t) + 1e-8
+            return t, ortho_to_t
+
+        @partial(jax.jit, static_argnums=(1,2))
+        def gen_t1_w1(key, d_in, d_ht):
+            d_ht_keys = random.split(key, d_ht)
+            t, ortho_t = vmap(generate_t1_single_ortho, in_axes=(0, None))(d_ht_keys, d_in) # make d_ht number of vectors, each size of d_in
+            # yields a size of d_ht, d_in, want it d_in, d_ht
+            return t.T, ortho_t.T
+        
+        t1_w1_batch, ortho_t1_w1_batch = vmap(gen_t1_w1, in_axes=(0, None, None))(t1_keys, d_in, d_ht)
+        # t1_w1_batch, ortho_t1_w1_batch = jnp.transpose(t1_w1_batch, axes=(2,0,1)), jnp.transpose(ortho_t1_w1_batch, axes=(2,0,1))
+
+        jax.debug.print("Teacher1 identical across runs? {}", 
+                jnp.allclose(t1_w1_batch[0], t1_w1_batch[1]))
+
 
         # --- Test Data (once) ---
-        test_key, script_master_key = random.split(script_master_key)
-        test_inputs = jax.random.normal(test_key, (test_size, d_in))
-
+        test_key_base, script_master_key = random.split(script_master_key, 2)
+        test_keys = random.split(test_key_base, num_runs)
+        test_inputs = vmap(jax.random.normal, in_axes=(0, None))(test_keys,
+                                                         (test_size, d_in))
 
         # # --- Model and Optimizer (once) ---
         student_model = StudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs)
@@ -393,25 +482,26 @@ if __name__ == "__main__":
             print(f"\n--- Starting Similarity v={v:.2f} ({v_idx+1}/{len(v_values)}) ---")
 
             # --- Prepare for vectorized run ---
-            v_master_key, script_master_key = random.split(script_master_key)
+            v_master_key, teacher_key, script_master_key = random.split(script_master_key, 3)
             run_keys = random.split(v_master_key, num_runs)
-
+            
             # Create teacher 2 (only needs one instance per v)
-            create_t2_key, _ = random.split(run_keys[0]) # Use one key just for t2 creation
-            teacher2_w1, teacher2_w2 = create_teacher2(v, create_t2_key)
-
+            t2_w1_batch = v*t1_w1_batch + jnp.sqrt(1-v**2)*ortho_t1_w1_batch
+            t2_w1_batch /= jnp.linalg.norm(t2_w1_batch, axis=1, keepdims=True) + 1e-8
+            teacher_similarity = jnp.mean(jnp.sum(t1_w1_batch * t2_w1_batch, axis=1))
+            print(f"Similarity between t1_w1 and t2_w1: {teacher_similarity}")
             # Precompute teacher targets for test_inputs
-            t1_test_targets = teacher_forward(test_inputs, teacher1_w1, teacher1_w2)
-            t2_test_targets = teacher_forward(test_inputs, teacher2_w1, teacher2_w2)
+            t1_test_targets = vmap(teacher_forward, in_axes=(0,0,0))(test_inputs, t1_w1_batch, t_w2_batch)
+            # t1_test_targets = teacher_forward(test_inputs, t1_w1_batch, t1_w2_batch)
+            t2_test_targets = vmap(teacher_forward, in_axes=(0,0,0))(test_inputs, t2_w1_batch, t_w2_batch)
+            # t2_test_targets = teacher_forward(test_inputs, t2_w1_batch, t2_w1_batch)
 
             # --- Execute the vectorized training ---
-            train_losses, test_losses1, test_losses2, overlap = vectorized_train_for_v(
-                # initial_params_batch,
-                # initial_opt_state_batch,
-                run_keys, # Pass the run keys for generating data inside scan
+            train_losses, test_losses1, test_losses2, overlap, masks_tuple, drift, params = vectorized_train_for_v(
+                run_keys, # Pass the num_run keys for generating data inside scan
                 script_master_key,
-                teacher1_w1, teacher1_w2,
-                teacher2_w1, teacher2_w2,
+                t1_w1_batch, t_w2_batch,
+                t2_w1_batch, t_w2_batch,
                 switch_point,
                 d_in,
                 sample_rate,
@@ -427,6 +517,7 @@ if __name__ == "__main__":
                 g_type,
                 d_hs,
                 d_h,
+                num_runs,
                 d_out
             )
             # train_losses etc have shape (num_samples, num_runs)
@@ -448,12 +539,24 @@ if __name__ == "__main__":
                 "d_hs": d_hs,
                 "d_in": d_in,
                 "g_type": g_type,
+                "mask1_batch": np.array(masks_tuple[0]),
+                "mask2_batch": np.array(masks_tuple[1]),
+                "drift": drift,
             }
-
+            params = {k:jax.device_get(params) for k,params in params.items()}
             # --- Save the aggregated results ---
-            filename = os.path.join(output_dir, f"g_type_{g_type}_v_{v:.2f}_spars_{sparsity:.2f}.npz")
+            npz_path = f"g_type_{g_type}_v_{v:.2f}_spars_{sparsity:.2f}.npz"
+            filename = os.path.join(output_dir, npz_path)
             np.savez(filename, **final_results_for_v)
+            pickle_path = f"g_type_{g_type}_v_{v:.2f}_spars_{sparsity:.2f}_params.pkl"
+            params_path = os.path.join(output_dir, pickle_path)
+            with open(params_path, "wb") as f:
+                pickle.dump(params, f)
+            file_tag = f"g_type_{g_type}_v_{v:.2f}_spars_{sparsity:.2f}"
+            save_param_hist(params, output_dir, file_tag)
             print(f"Results Saved for v={v:.2f} (Shape e.g., train_loss: {final_results_for_v['train_loss'].shape})")
+            plot_loss(filename, head=1)
+            plot_loss(filename, head=2)
 
         print(f"\n--- All experiments finished ---\nSaved at {output_dir}\nWith sparse values: {arg_dict}")
 
