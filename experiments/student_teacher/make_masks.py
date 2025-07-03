@@ -25,7 +25,7 @@ def deterministic_gates2(key, v, s, d_in, n_vectors):
     determ_keys = jax.random.split(key1, n_vectors)
     g_1 = jax.vmap(lambda k: jax.random.bernoulli(k, pi, (d_in)))(determ_keys).astype(jnp.float32)
     not_g1 = 1 - g_1 # will be 1's where g_1 had zeros, use for p0
-    u = jnp.clip((0.5*jnp.tanh(b*(v-m))+0.5), min=0.05, max=1.0)
+    u = jnp.clip((0.5*jnp.tanh(b*(v-m))+0.5), min=0.0, max=1.0)
     # u = jnp.clip((4*(v-0.5)**2), min=0.05, max=1.0)
     p1 = g_1 * u
     p0 = not_g1 * jnp.clip(((1 - s)/(s+1e-12)) * (1 - u), min=0.0, max=1.0)
@@ -35,35 +35,27 @@ def deterministic_gates2(key, v, s, d_in, n_vectors):
     g_2 = jax.random.bernoulli(g2_key, P, (g_1.shape)).astype(jnp.float32)
     return g_1, g_2
 
-def deterministic_gates(key, v, s, d_in, n_vectors):
-    o = 0.4 * jnp.pi # 1.3 before
-    h = v + o # + 0.4 * jnp.pi
-    theta = jnp.array([jnp.cos(h*jnp.pi), jnp.sin(h*jnp.pi)])
-    determ_keys = jax.random.split(key, n_vectors*2)
-    # print(f"{theta.shape=}") # equals (2,)
-    base = jax.vmap(lambda k: jax.random.uniform(k, (d_in)))(determ_keys)
-    base = jnp.reshape(base, (n_vectors, d_in, 2))
-    # print(f"{base.shape=}") # = (50, 100, 1, 2)
-    z = base @ theta
-    # print(f"{z.shape=}") # = (50, 100, 1)
-    ones = jnp.ones_like(z)
-    m = 0
-    g_determ = jnp.heaviside(z - (s-m), ones)
-
-    # print(f"{base.shape=}")
-    #####
-    # m = 10
-    # z_sigmoid = 1.5/ (1 + jnp.exp(-m*(z)))
-    # # # Create smooth threshold
-    # s = s-0.01
-    # g_determ = (z_sigmoid > s).astype(jnp.float32)
-    #######
-    return g_determ.astype(jnp.float32)
     
+def overlap_gates(key, v, s, u, d_in, n_vectors):
+    '''Sparsity will be fixed at 0.5 
+        s will dictate the overlap'''
+    pi = s
+    key1, key2 = jax.random.split(key, 2)
+    determ_keys = jax.random.split(key1, n_vectors)
+    g_1 = jax.vmap(lambda k: jax.random.bernoulli(k, pi, (d_in)))(determ_keys).astype(jnp.float32)
+    not_g1 = 1 - g_1 # will be 1's where g_1 had zeros, use for p0
+    p1 = g_1 * u
+    p0 = not_g1 * (1-u)
+    P = p1 + p0 # should be same shape as g_1
+    g2_key, key = jax.random.split(key2)
+    g_2 = jax.random.bernoulli(g2_key, P, (g_1.shape)).astype(jnp.float32)
+    return g_1, g_2
+
 
 def create_masks(d_in: int,
                   sparsity: float,
                   v: float, # task similarity; 0: orthog, 1: same
+                  u: float, # overlap
                   m_type: str, # determ or random
                   key: jax.random.PRNGKey) -> Tuple[jnp.ndarray, jnp.ndarray, float]:
     masks = None
@@ -75,9 +67,11 @@ def create_masks(d_in: int,
     elif m_type=='determ':
         # masks = deterministic_gates(key, v, sparsity, d_in, 2)
         mask1, mask2 = deterministic_gates2(key, v, sparsity, d_in, 1)
+    elif m_type=='overlap':
+        mask1, mask2 = overlap_gates(key, v, sparsity, u, d_in, 1)
     # set_trace()
 
-    assert mask1 != None, f"type not possible, got {m_type=}, should be either 'determ' or 'random'."
+    assert mask1 != None, f"type not possible, got {m_type=}, should be one of ('determ','random','overlap')."
 
     overlap = jnp.sum(jnp.multiply(mask1, mask2), axis=-1)/jnp.sum(mask1)
     return mask1, mask2, overlap

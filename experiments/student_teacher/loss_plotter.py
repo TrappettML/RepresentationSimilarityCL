@@ -44,6 +44,9 @@ def my_med(y, x):
 def my_mean(y, x):
     return jnp.mean(y)
 
+def my_min(y, x):
+    return jnp.min(y)
+
 def get_metric_func(metric: str):
     if metric == 'auc':
         return my_trap
@@ -51,6 +54,8 @@ def get_metric_func(metric: str):
         return my_med
     elif metric == 'mean':
         return my_mean
+    elif metric == 'min':
+        return my_min
     raise ValueError(f"Unknown metric: {metric}")
 
 
@@ -175,6 +180,7 @@ def load_grouped_metric_data(data_dir: Path, verbose: bool=True) -> Tuple[Dict, 
                         "loss2_raw": dat["test_loss2"],
                         "switch_point": int(meta["switch_point"]),
                         "num_runs": dat["test_loss1"].shape[1],
+                        "overlap": dat["overlap"],
                     })
             except Exception as e:
                 _log(f"Error reading {npz_path.name}: {e}", verbose)
@@ -191,12 +197,17 @@ class MetricSeries:
     v:   List[float] = field(default_factory=list)
     mu:  List[float] = field(default_factory=list)
     sig: List[float] = field(default_factory=list)
+    overlap_mu: List[float] = field(default_factory=list)
+    overlap_sig: List[float] = field(default_factory=list)
 
     def sorted_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         order = np.argsort(self.v)
         return (np.asarray(self.v)[order],
                 np.asarray(self.mu)[order],
-                np.asarray(self.sig)[order])
+                np.asarray(self.sig)[order],
+                np.asarray(self.overlap_mu)[order],
+                np.asarray(self.overlap_sig)[order])
+
     
 
 # ============  Main Metric Plot Function ============
@@ -213,10 +224,33 @@ def generate_metric_plot(
     if not grouped or meta_ref is None:
         return None
     # set_trace()
+    # ========== Load overlap max metrics ==========
+    try:
+        # Get the base path from data_dir (assuming structure: base_path/loss_data/sparsity_X)
+        base_path = data_dir.parent.parent
+        # Path to overlap metrics
+        overlap_path = Path("/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/overlap_search_plots")
+        overlap_file = overlap_path / f"overlap_metrics_{metric}.npz"
+        
+        if overlap_file.exists():
+            overlap_data = np.load(overlap_file)
+            print(f"Loaded overlap metrics from: {overlap_file}")
+        else:
+            print(f"Overlap file not found: {overlap_file}")
+            overlap_data = None
+    except Exception as e:
+        print(f"Error loading overlap metrics: {str(e)}")
+        overlap_data = None
+    # ========== END overlap ==========
+
     metric_names = ("rem", "ft_t1", "ft_t2", "zs")
-    colors = {'random': 'rgba(255,0,0,1)', 'determ': 'rgba(0,0,255,1)'}
+    colors = {
+        'random': 'rgba(255,0,0,1)',
+        'determ': 'rgba(0,0,255,1)',
+        'overlap_max': 'rgba(0,128,0,1)'  # Green for overlap max
+    }
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.09,
-                       subplot_titles=[f"Task {i} {metric.upper()}" for i in (1, 2)])
+                       subplot_titles=[f"{name.upper()} {metric.upper()}" for name in metric_names])
         # g_type  -> metric_name -> MetricSeries
     series: Dict[str, Dict[str, MetricSeries]] = {
         g: {m: MetricSeries() for m in metric_names} for g in colors
@@ -243,22 +277,16 @@ def generate_metric_plot(
             rem, ft1, ft2, zs = map(np.asarray, zip(*per_run))
             v = float(exp["v"])
 
-            # store
-            series[g_type]["rem"].v.append(v)
-            series[g_type]["rem"].mu.append(rem.mean())
-            series[g_type]["rem"].sig.append(rem.std())
+            overlap_mu = np.mean(exp["overlap"])
+            overlap_sig = np.std(exp["overlap"])
 
-            series[g_type]["ft_t1"].v.append(v)
-            series[g_type]["ft_t1"].mu.append(ft1.mean())
-            series[g_type]["ft_t1"].sig.append(ft1.std())
-
-            series[g_type]["ft_t2"].v.append(v)
-            series[g_type]["ft_t2"].mu.append(ft2.mean())
-            series[g_type]["ft_t2"].sig.append(ft2.std())
-
-            series[g_type]["zs"].v.append(v)
-            series[g_type]["zs"].mu.append(zs.mean())
-            series[g_type]["zs"].sig.append(zs.std())
+            # Store metrics
+            for metric_name, values in zip(metric_names, [rem, ft1, ft2, zs]):
+                series[g_type][metric_name].v.append(v)
+                series[g_type][metric_name].mu.append(values.mean())
+                series[g_type][metric_name].sig.append(values.std())
+                series[g_type][metric_name].overlap_mu.append(overlap_mu)
+                series[g_type][metric_name].overlap_sig.append(overlap_sig)
 
     # ------------------------------------------------------------------
     # Plotting ----------------------------------------------------------
@@ -274,7 +302,7 @@ def generate_metric_plot(
             if not curve.v:
                 continue
 
-            v, m, s = curve.sorted_arrays()
+            v, m, s, om, osig = curve.sorted_arrays()
 
             # ribbon
             fig.add_trace(
@@ -286,6 +314,7 @@ def generate_metric_plot(
                     line_color="rgba(0,0,0,0)",
                     showlegend=False,
                     legendgroup=g_type,
+                    hoverinfo='none',
                 ),
                 row=1, col=col,
             )
@@ -298,12 +327,70 @@ def generate_metric_plot(
                     name=g_type if col == 1 else None,   # one legend entry
                     legendgroup=g_type,
                     showlegend=(col == 1),
+                    # HIGHLIGHT START
+                    customdata=np.stack([om, osig], axis=-1),
+                    hovertemplate=(
+                        f"<b>{g_type}</b><br>"
+                        "v: %{x:.2f}<br>"
+                        f"{metric_name}: %{{y:.3f}}<br>"
+                        "overlap: %{customdata[0]:.3f} ± %{customdata[1]:.3f}"
+                        "<extra></extra>"
+                    ),
+                    # HIGHLIGHT END
+                ),
+                row=1, col=col,
+            )       
+
+        # axis labels row‑wise
+        fig.update_yaxes(title_text=f"{metric_name}", row=1, col=col, exponentformat='e')
+        # ========== Plot overlap max metrics ==========
+        if overlap_data is not None:
+            # Get overlap data for this metric
+            v_arr = overlap_data['unique_v']
+            max_vals = overlap_data[f'max_{metric_name}']
+            max_sigs = overlap_data[f'max_sig_{metric_name}']
+            max_overlaps = overlap_data[f'max_overlap_{metric_name}']
+
+            # Overlap max line
+            # Overlap error region
+            fig.add_trace(
+                go.Scatter(
+                    x=np.concatenate([v_arr, v_arr[::-1]]),
+                    y=np.concatenate([max_vals + max_sigs, (max_vals - max_sigs)[::-1]]),
+                    fill='toself',
+                    fillcolor=colors['overlap_max'].replace("1)", "0.2)"),
+                    line=dict(color='rgba(0,0,0,0)'),
+                    showlegend=False,
+                    legendgroup='overlap_max',
+                    hoverinfo='none',
+                ),
+                row=1, col=col,
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=v_arr,
+                    y=max_vals,
+                    mode='lines+markers',
+                    line=dict(color=colors['overlap_max'], width=4, dash='dash'),
+                    marker=dict(size=8, color=colors['overlap_max']),
+                    name='Overlap Max' if col == 1 else None,
+                    legendgroup='overlap_max',
+                    showlegend=(col == 1),
+                    customdata=max_overlaps,
+                    hovertemplate=(
+                    "<b>Overlap Max</b><br>"
+                    "v: %{x:.2f}<br>"
+                    f"{metric_name}: %{{y:.3f}}<br>"
+                    "overlap: %{customdata:.3f}"
+                    "<extra></extra>"
+                    ),
                 ),
                 row=1, col=col,
             )
 
-        # axis labels row‑wise
-        fig.update_yaxes(title_text=f"{metric_name}", row=1, col=col, exponentformat='e')
+            
+        # ========== END overlap plot ==========
 
     fig.update_xaxes(title_text="similarity v")
     fig.update_layout(
@@ -311,7 +398,7 @@ def generate_metric_plot(
         height=400,
         width=2000,
         template="plotly_white",
-        hovermode="x unified", 
+        hovermode="closest", 
         font=dict(
                     family="DejaVu Sans Bold",
                     size=20,
@@ -523,7 +610,7 @@ def generate_loss_plots(
             _log(f"Skipping   {npz_path.name}   (does not match naming scheme).", verbose)
             continue
         v_val = float(m.group(2))
-
+        # set_trace()
         try:
             with np.load(npz_path) as dat:
                 # -------- sanity checks --------
@@ -548,7 +635,7 @@ def generate_loss_plots(
                             raise ValueError(
                                 f"Meta-data mismatch in {npz_path.name}: {k} differs."
                             )
-                overlap_arr = dat["overlap"]
+                overlap_arr = dat["overlap"] # old determ and random sill have overlap as key
                 # set_trace()
                 results.append({
                     "v"            : v_val,

@@ -10,6 +10,7 @@ import numpy as np
 from functools import partial
 from jax.scipy.special import erf
 import sys
+from typing import Sequence
 
 # -------------------------
 # Model Definitions
@@ -30,20 +31,17 @@ def teacher_forward(x, w1, w2):
     return jnp.dot(nn.relu(h), w2)
 
 
-class SingleStudentNetwork(nn.Module):
-    hidden_dim: int
+class ExpertNetwork(nn.Module):
+    features: Sequence[int]
+    # hidden_dim: int
     head_hidden_dim: int
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(
-            self.hidden_dim,
-            use_bias=False,
-            name="backbone_dense",
-            kernel_init=scaled_normal_init(jnp.sqrt(2 / x.shape[-1])),
-            # kernel_init=scaled_normal_init(0.001),
-        )(x) / jnp.sqrt(x.shape[-1])
-        x = nn.relu(x)
+        for i, feat in enumerate(self.features):
+            x = nn.Dense(feat, name=f'hidden_{i}')(x)/ jnp.sqrt(x.shape[-1])
+            x = nn.relu(x)
+        
         x = nn.Dense(
             1,
             use_bias=False,
@@ -57,7 +55,7 @@ class SingleStudentNetwork(nn.Module):
 # Training Utilities
 # -------------------------
 def create_initial_state(rng, optimizer, sample_input, d_hs, d_h):
-    model = SingleStudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs)
+    model = ExpertNetwork(features=d_h, head_hidden_dim=d_hs)
     params = model.init(rng, sample_input)['params']
     opt_state = optimizer.init(params)
     return params, opt_state
@@ -91,8 +89,8 @@ def evaluate_metrics(params, apply_fn, test_inputs, teacher_w1, teacher_w2):
 # -------------------------
 # @partial(jit, static_argnames=("sample_rate", "d_in", "batch_size", "model_apply_fn", 
 #                               "optimizer", "num_epochs", "d_hs", "d_h", "num_runs"))
-@partial(jax.pmap, axis_name="device",
-         static_broadcasted_argnums=(3,4,5,6,8,9,10,11))  # all static args after initial arrays
+@partial(jax.jit,
+         static_argnums=(3,4,5,6,8,9,10,11))  # all static args after initial arrays
 def vectorized_train_single_task(
     initial_keys_batch,
     teacher_w1,
@@ -158,11 +156,11 @@ if __name__ == "__main__":
     arg_names = ['d_hs', 'path']
     arg_dict = dict(zip(arg_names, args))
     d_hs = int(arg_dict.get('d_hs', 200))
-    parent_path = arg_dict.get('path', "./loss_data/single_expert_teacher/")
+    parent_path = arg_dict.get('path', "./loss_data/expert_test_mul_layer/")
     print(jax.devices())
     # Configuration
     d_in = 800
-    d_h = d_hs
+    d_h = (d_hs, d_hs)
     d_out = 1
     num_epochs = 250_000
     lr = 0.1
@@ -180,15 +178,6 @@ if __name__ == "__main__":
     output_dir = f"{parent_path}/d_h_{d_h}_d_hs_{d_hs}_lr_{lr}/"
     os.makedirs(output_dir, exist_ok=True)
 
-    # # Initialize
-    # key = random.PRNGKey(42)
-    # key, t1_key, test_key = random.split(key, 3)
-    # t1_w1_key, t1_w2_key = random.split(t1_key)
-    # # Teacher 1 (fixed)
-    # t1_w1 = random.normal(t1_key, (num_runs, d_in, 1))
-    # t1_w1 /= jnp.linalg.norm(t1_w1, axis=(1,2), keepdims=True)
-    # t1_w2 = random.normal(t1_w2_key, (num_runs, 1, 1))
-    # t1_w2 /= jnp.linalg.norm(t1_w2, axis=(1,2), keepdims=True)
     # --- Master key ---
     script_master_key = random.PRNGKey(42)
 
@@ -224,7 +213,7 @@ if __name__ == "__main__":
     test_inputs = random.normal(test_key, (num_runs, test_size, d_in))
 
     # Model & Optimizer
-    student = SingleStudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs)
+    student = ExpertNetwork(features=d_h, head_hidden_dim=d_hs)
     optimizer = optax.sgd(lr)
     
     def split_for_devices(x):
@@ -236,7 +225,11 @@ if __name__ == "__main__":
     t1_w2_dev = jax.device_put_sharded(list(split_for_devices(t_w2_batch)), jax.local_devices())
     test_inputs_dev  = jax.device_put_sharded(list(split_for_devices(test_inputs)), jax.local_devices())
 
-
+    pmapped_train_fn = jax.pmap(
+        vectorized_train_single_task,
+        axis_name="device",
+        static_broadcasted_argnums=(3,4,5,6,8,9,10,11)
+    )
     for v in v_values:
         print(f"Begining {v=}")
         key, run_key, t2_key, rand_vec_key = random.split(script_master_key, 4)
@@ -256,7 +249,7 @@ if __name__ == "__main__":
         run_keys_dev = jax.device_put_sharded(list(split_for_devices(run_keys)), jax.local_devices())
 
         # Train
-        train_loss_dev, test_loss_dev = vectorized_train_single_task(
+        train_loss_dev, test_loss_dev = pmapped_train_fn(
             run_keys_dev,
             t2_w1_dev,
             t2_w2_dev,

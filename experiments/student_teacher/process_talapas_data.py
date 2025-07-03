@@ -42,13 +42,13 @@ def make_training_plots(list_of_files, data_root, plot_root):
 def main():
     # data_path = "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/experiments/student_teacher/data/single_layer_runs"
     # plots_path = "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/experiments/student_teacher/data/result_figures/single_layers_runs"
-    data_path = "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/d_ht"
+    data_path = "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/overlap/comparison"
     plots_path = data_path + "_plots/"
     list_of_files_paths = get_files_and_paths(data_path)
     make_training_plots(list_of_files_paths, data_path, plots_path)
 
     print(f"Finished with plots, plots located in {plots_path=}")
-    set_trace()
+    # set_trace()
 
 if __name__ == '__main__':
     main()
