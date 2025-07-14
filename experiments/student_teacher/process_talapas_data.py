@@ -29,6 +29,7 @@ def make_training_plots(list_of_files, data_root, plot_root):
         diff_fig.write_html(f"{plot_path}/diff_fig.html")
         comp_diff_fig.write_html(f"{plot_path}/comp_diff_fig.html")
         auc_fig.write_html(f"{plot_path}/auc_fig.html")
+        auc_fig.write_image(f"{plot_path}/auc_fig.pdf")
         mean_fig.write_html(f"{plot_path}/mean_fig.html")
         med_fig.write_html(f"{plot_path}/median_fig.html")
         result_paths.append(plot_path)
@@ -43,7 +44,7 @@ def main():
     # data_path = "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/experiments/student_teacher/data/single_layer_runs"
     # plots_path = "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/experiments/student_teacher/data/result_figures/single_layers_runs"
     data_path = "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/overlap/comparison"
-    plots_path = data_path + "_plots/"
+    plots_path = data_path + "expert_test_plots/"
     list_of_files_paths = get_files_and_paths(data_path)
     make_training_plots(list_of_files_paths, data_path, plots_path)
 

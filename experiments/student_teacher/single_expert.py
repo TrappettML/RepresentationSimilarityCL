@@ -34,7 +34,7 @@ def teacher_forward(x, w1, w2):
 class ExpertNetwork(nn.Module):
     features: Sequence[int]
     # hidden_dim: int
-    head_hidden_dim: int
+    # head_hidden_dim: int
 
     @nn.compact
     def __call__(self, x):
@@ -54,8 +54,8 @@ class ExpertNetwork(nn.Module):
 # -------------------------
 # Training Utilities
 # -------------------------
-def create_initial_state(rng, optimizer, sample_input, d_hs, d_h):
-    model = ExpertNetwork(features=d_h, head_hidden_dim=d_hs)
+def create_initial_state(rng, optimizer, sample_input, features):
+    model = ExpertNetwork(features=features) # , head_hidden_dim=d_hs
     params = model.init(rng, sample_input)['params']
     opt_state = optimizer.init(params)
     return params, opt_state
@@ -90,7 +90,7 @@ def evaluate_metrics(params, apply_fn, test_inputs, teacher_w1, teacher_w2):
 # @partial(jit, static_argnames=("sample_rate", "d_in", "batch_size", "model_apply_fn", 
 #                               "optimizer", "num_epochs", "d_hs", "d_h", "num_runs"))
 @partial(jax.jit,
-         static_argnums=(3,4,5,6,8,9,10,11))  # all static args after initial arrays
+         static_argnums=(3,4,5,6,8,9,10))  # all static args after initial arrays
 def vectorized_train_single_task(
     initial_keys_batch,
     teacher_w1,
@@ -102,14 +102,14 @@ def vectorized_train_single_task(
     test_inputs,
     num_epochs,
     batch_size,
-    d_hs,
+    # d_hs,
     d_h,
 ):  
     local_runs = initial_keys_batch.shape[0]
     vmap_create_state = vmap(partial(create_initial_state, 
                                    optimizer=optimizer,
                                    sample_input=jnp.ones((1, d_in)),
-                                   d_hs=d_hs, d_h=d_h))
+                                   features=d_h))
     initial_params_batch, initial_opt_state_batch = vmap_create_state(initial_keys_batch)
 
     @jit
@@ -213,7 +213,7 @@ if __name__ == "__main__":
     test_inputs = random.normal(test_key, (num_runs, test_size, d_in))
 
     # Model & Optimizer
-    student = ExpertNetwork(features=d_h, head_hidden_dim=d_hs)
+    student = ExpertNetwork(features=d_h) # , head_hidden_dim=d_hs
     optimizer = optax.sgd(lr)
     
     def split_for_devices(x):
@@ -228,7 +228,7 @@ if __name__ == "__main__":
     pmapped_train_fn = jax.pmap(
         vectorized_train_single_task,
         axis_name="device",
-        static_broadcasted_argnums=(3,4,5,6,8,9,10,11)
+        static_broadcasted_argnums=(3,4,5,6,8,9,10)
     )
     for v in v_values:
         print(f"Begining {v=}")
@@ -260,7 +260,7 @@ if __name__ == "__main__":
             test_inputs_dev,
             num_epochs,
             batch_size,
-            d_hs,
+            # d_hs,
             d_h,
         )
 

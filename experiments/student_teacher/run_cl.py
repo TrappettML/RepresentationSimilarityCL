@@ -53,6 +53,7 @@ def plot_loss(npz_path: str | Path,
     epochs     = data["epochs"]                          # (num_samples,)
     train_loss = data["train_loss"]                      # (num_samples, num_runs)
     test_loss  = data[f"test_loss{head}"]                # (num_samples, num_runs)
+    switch_point = data["switch_point"]
 
     # Compute means and standard deviations
     train_loss_mean = train_loss.mean(axis=1)
@@ -60,29 +61,89 @@ def plot_loss(npz_path: str | Path,
     test_loss_mean = test_loss.mean(axis=1)
     test_loss_std = test_loss.std(axis=1)
 
-    fig, ax = plt.subplots()
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12), sharex=True)
     
     # Plot train loss with shaded region
-    ax.plot(epochs, train_loss_mean, label="train loss")
-    ax.fill_between(epochs, 
+    ax1.plot(epochs, train_loss_mean, label="train loss")
+    ax1.fill_between(epochs, 
                    train_loss_mean - train_loss_std, 
                    train_loss_mean + train_loss_std,
                    alpha=0.3)
     
     # Plot test loss with shaded region
     test_label = f"test loss (head {head})"
-    ax.plot(epochs, test_loss_mean, label=test_label)
-    ax.fill_between(epochs, 
+    ax1.plot(epochs, test_loss_mean, label=test_label)
+    ax1.fill_between(epochs, 
                    test_loss_mean - test_loss_std, 
                    test_loss_mean + test_loss_std,
                    alpha=0.3)
+    # Add expert loss if available and for head 2
+    if "expert_test_loss" in data:
+        expert_loss = data["expert_test_loss"]
+               # Ensure array is 2D (num_samples, num_runs)
+        if expert_loss.ndim == 1:
+            expert_loss = expert_loss[:, np.newaxis]
 
-    ax.set_xlabel("training step")
-    ax.set_ylabel("MSE")
+        expert_epochs = epochs[epochs >= switch_point][:len(expert_loss)]
+        
+        if len(expert_epochs) > 0:
+            expert_loss_mean = expert_loss.mean(axis=1)
+            expert_loss_std = expert_loss.std(axis=1)
+            
+            ax1.plot(expert_epochs, expert_loss_mean, label="expert test loss")
+            ax1.fill_between(expert_epochs,
+                           expert_loss_mean - expert_loss_std,
+                           expert_loss_mean + expert_loss_std,
+                           alpha=0.3)
+
+    ax1.set_xlabel("training step")
+    ax1.set_ylabel("MSE")
     if log_y:
-        ax.set_yscale("log")
-    ax.set_title(npz_path.stem)
-    ax.legend()
+        ax1.set_yscale("log")
+    ax1.set_title(npz_path.stem)
+    ax1.legend()
+
+        # --- Bottom plot: Expert Training Loss ---
+    if head == 2 and "expert_train_loss" in data:
+        expert_train_loss = data["expert_train_loss"]
+               # Ensure array is 2D (num_samples, num_runs)
+        if expert_loss.ndim == 1:
+            expert_loss = expert_loss[:, np.newaxis]
+        expert_epochs = epochs[epochs >= switch_point][:len(expert_train_loss)]
+        
+        if len(expert_epochs) > 0:
+            expert_train_mean = expert_train_loss.mean(axis=1)
+            expert_train_std = expert_train_loss.std(axis=1)
+            
+            ax2.plot(expert_epochs, expert_train_mean, label="expert train loss", color="purple")
+            ax2.fill_between(expert_epochs,
+                           expert_train_mean - expert_train_std,
+                           expert_train_mean + expert_train_std,
+                           alpha=0.3, color="purple")
+            
+            # Add expert test loss for comparison
+            if "expert_test_loss" in data:
+                expert_test_loss = data["expert_test_loss"]
+                expert_test_mean = expert_test_loss.mean(axis=1)
+                expert_test_std = expert_test_loss.std(axis=1)
+                
+                ax2.plot(expert_epochs, expert_test_mean, label="expert test loss", color="green")
+                ax2.fill_between(expert_epochs,
+                               expert_test_mean - expert_test_std,
+                               expert_test_mean + expert_test_std,
+                               alpha=0.3, color="green")
+    ax2.set_xlabel("training step")
+    ax2.set_ylabel("MSE")
+    if log_y:
+        ax2.set_yscale("log")
+    ax2.legend()
+    ax2.grid(True, which="both", ls="-", alpha=0.2)
+
+    # Add vertical line at task switch
+    for ax in (ax1, ax2):
+        ax.axvline(x=switch_point, color='r', linestyle='--', alpha=0.7)
+        ax.text(switch_point + 1000, ax.get_ylim()[1]*0.9, 
+                'Task Switch', rotation=90, color='r', alpha=0.7)
 
     # --- automatic file name -------------------------------------------------
     out_png = npz_path.with_name(f"{npz_path.stem}_head{head}_loss.png")
@@ -147,35 +208,31 @@ class StudentNetwork(nn.Module):
         # x = nn.relu(x)
         x = self.layer1(x)
         x = nn.relu(x)
-        eps = 1e-8
-        norm_s1 = jnp.sqrt(jnp.maximum(masks[0].sum(), eps))
-        norm_s2 = jnp.sqrt(jnp.maximum(masks[1].sum(), eps))    
-        hidden_s1 = x*masks[0] 
-        hidden_s1 /= norm_s1 # normalize based on n active units
-        hidden_s2 = x*masks[1]  
-        hidden_s2 /= norm_s2 # normalize based on n active units
+        # eps = 1e-8
+        # norm_s1 = jnp.sqrt(jnp.maximum(masks[0].sum(), eps))
+        # norm_s2 = jnp.sqrt(jnp.maximum(masks[1].sum(), eps))    
+        # hidden_s1 = x*masks[0] 
+        # hidden_s1 /= norm_s1 # normalize based on n active units
+        # hidden_s2 = x*masks[1]  
+        # hidden_s2 /= norm_s2 # normalize based on n active units
+        
+        def apply_mask_and_head(mask):
+            norm = jnp.sqrt(jnp.maximum(mask.sum(), 1e-8))
+            h = x * mask
+            h = h / norm
+            return self.head_layer(h)
+        # s1_out = self.head_layer(hidden_s1)
+        # s2_out = self.head_layer(hidden_s2) # share the final head weight, single output because of single regression.
+        masks_array = jnp.stack(masks, axis=0)  # shape (num_tasks, hidden_dim)
+        outputs = jax.vmap(apply_mask_and_head)(masks_array)
+        # return s1_out, s2_out
+        return outputs
 
-        # second masked layer
-        # hidden2_s1 = self.layer2(hidden_s1)
-        # hidden2_s2 = self.layer2(hidden_s2)
-        # hidden2_s1 = nn.relu(hidden2_s1)
-        # hidden2_s2 = nn.relu(hidden2_s2)
-        # hidden2_s1 = hidden2_s1*masks[0]
-        # hidden2_s2 = hidden2_s2*masks[1]
-        # hidden2_s1 /= norm_s1
-        # hidden2_s2 /= norm_s2
-        # s1_out = self.head_layer(hidden2_s1)
-        # s2_out = self.head_layer(hidden2_s2) # share the final head weight, single output because of single regression.
-        # for single layer:
-        s1_out = self.head_layer(hidden_s1)
-        s2_out = self.head_layer(hidden_s2) # share the final head weight, single output because of single regression.
-        return s1_out, s2_out
-
-def create_initial_state_parts(rng, mask_pair,  *, optimizer, sample_input, d_hs, d_h):
+def create_initial_state_parts(rng, masks,  *, optimizer, sample_input, d_hs, d_h):
     # rng is the *model* key now – no split needed
     params = StudentNetwork(hidden_dim=d_h,
                             head_hidden_dim=d_hs).init(
-                rng, sample_input, mask_pair
+                rng, sample_input, masks
              )['params']
     return params, optimizer.init(params)
 
@@ -205,6 +262,7 @@ def compute_grads(params, batch, teacher_w1, teacher_w2, head_idx, apply_fn, mas
     return loss, grads
 
 # Evaluation step (similar, but uses vmap internally for test data)
+##FIX## need to make targets an array to vmap over?
 @partial(jit, static_argnums=(1,)) # apply_fn is static
 def evaluate_metrics(params, apply_fn, test_inputs, t1_targets, t2_targets, masks):
     """Computes test losses for a single run's parameters."""
@@ -220,7 +278,7 @@ def evaluate_metrics(params, apply_fn, test_inputs, t1_targets, t2_targets, mask
 # Make static args explicit for clarity
 @partial(jit, static_argnames=("switch_point", "sample_rate",
                                "d_in", "batch_size", "model_apply_fn", "optimizer", 
-                               "num_epochs", "sparsity", "overlap", "g_type", "d_hs", "d_h", "num_runs", "lr")) # , "d_out"
+                               "num_epochs", "sparsity", "overlap", "g_type", "d_hs", "d_h", "num_runs", "lr", "ntasks")) # , "d_out"
 def vectorized_train_for_v(
     # initial_params_batch, # Shape (num_runs, ...) PyTree
     initial_keys_batch, # Shape (num_runs, 2)
@@ -246,7 +304,7 @@ def vectorized_train_for_v(
     d_h,
     num_runs,
     lr,
-    # d_out
+    ntasks,
     ):
     # create num_runs keys for masks and models, separate than batch keys (initial_keys_batch)
     mask_master_key, model_master_key = jax.random.split(master_key)
@@ -438,12 +496,13 @@ if __name__ == "__main__":
     # default_d_hs = 400
     # default_d_ht = 200 # half the size of the student hidden dim
     parser = argparse.ArgumentParser(description="Run StudentTeacher Single Layer Experiment")
-    parser.add_argument("--d_hs", type=int, default=200, help="full size of student hidden layer (w/ no sparsity)")
+    parser.add_argument("--d_hs", type=int, default=400, help="full size of student hidden layer (w/ no sparsity)")
     parser.add_argument("--sparsity", type=float, default=0.5, help="Sparsity level")
     parser.add_argument("--g_type", type=str, default="overlap", help="Mask generation type, one of ('random','determ','overlap')")
     parser.add_argument("--overlap", type=float, default=0.0, help="amount of shared units between two tasks")
     parser.add_argument("--d_ht", type=int, default=200, help="Hidden size for teacher nets.")
-    parser.add_argument("--path", type=str, default="./loss_data/overlap_search_test/under_capacity_twolayer", help="Output directory path")
+    parser.add_argument("--path", type=str, default="./loss_data/overlap_network_experiment/equal_capacity", help="Output directory path")
+    parser.add_argument("--ntasks", type=int, default=2, help="How many tasks to train on in sequence without repeat")
     args = parser.parse_args()
 
     d_hs = args.d_hs
@@ -452,6 +511,7 @@ if __name__ == "__main__":
     g_type = args.g_type
     parent_path = args.path
     overlap = args.overlap
+    ntasks = args.ntasks
 
     avail_gpus = jax.devices()
     print(jax.devices())
@@ -466,9 +526,9 @@ if __name__ == "__main__":
     test_size = 10000
     batch_size = 200 # make larger than input size for better generalization
     d_h = d_hs # make them equal # now there is no shared hidden layer
-    expert_dh = (d_h, d_h)
+    expert_dh = (d_h,)
     d_out = 1
-    output_dir = f"{parent_path}/d_ht_{d_ht}_d_hs_{d_hs}_sparsity_{sparsity:.2f}_g_type_{g_type}_lr_{lr}_overlap_{overlap:.2f}/"
+    output_dir = f"{parent_path}/ntasks_{ntasks}/d_ht_{d_ht}_d_hs_{d_hs}_sparsity_{sparsity:.2f}_g_type_{g_type}_lr_{lr}_overlap_{overlap:.2f}/"
     os.makedirs(output_dir, exist_ok=True)
     print(f"Args: {args}")
 
@@ -565,13 +625,14 @@ if __name__ == "__main__":
                 d_h,
                 num_runs,
                 lr,
+                ntasks,
             )
             
             print(f'Training Expert')
-            expert_model = expert.ExpertNetwork(features=expert_dh, head_hidden_dim=d_hs)
+            expert_model = expert.ExpertNetwork(features=expert_dh)
             expert_run_keys = jax.random.split(expert_key, num_runs)
             test_inputs_batch = jnp.repeat(test_inputs[None, ...], num_runs, axis=0)  # Shape: (num_runs, 10000, 800)
-            _, expert_test_losses = expert.vectorized_train_single_task(
+            expert_train_losses, expert_test_losses = expert.vectorized_train_single_task(
                                                                         expert_run_keys,
                                                                         t2_w1_batch,
                                                                         t_w2_batch,
@@ -582,12 +643,11 @@ if __name__ == "__main__":
                                                                         test_inputs_batch,
                                                                         switch_point,  # Train for the same duration as the student on Task 2
                                                                         batch_size,
-                                                                        d_hs,
+                                                                        # d_hs,
                                                                         expert_dh,
                                                                         )
-            final_expert_loss_t2 = expert_test_losses[-1]
 
-            return (v, *results, teacher_similarity, final_expert_loss_t2)
+            return (v, *results, teacher_similarity, expert_train_losses, expert_test_losses)
 
         
         num_devices = jax.local_device_count()
@@ -622,7 +682,8 @@ if __name__ == "__main__":
                 masks_tuple = (batch_results[5][0][i], batch_results[5][1][i])
                 params_dict = process_params_results(batch_results[6], i)
                 teacher_similarity = batch_results[7][i]
-                final_expert_loss = batch_results[8][i]
+                final_expert_train_loss = batch_results[8][i]
+                final_expert_test_loss = batch_results[9][i]
                 
                 print(f"Similarity between t1_w1 and t2_w1: {teacher_similarity}")
                 # --- Prepare results for saving ---
@@ -633,7 +694,8 @@ if __name__ == "__main__":
                     "train_loss": np.array(sampled_losses),
                     "test_loss1": np.array(sampled_test1),
                     "test_loss2": np.array(sampled_test2),
-                    "expert_loss": np.array(final_expert_loss),
+                    "expert_train_loss": np.array(final_expert_train_loss),
+                    "expert_test_loss": np.array(final_expert_test_loss),
                     "epochs": epochs_array[:num_samples], # Ensure epochs match samples dim
                     "num_epochs": num_epochs,
                     "overlap_output": overlap_outs,
@@ -662,7 +724,7 @@ if __name__ == "__main__":
                 # save_param_hist(params, output_dir, file_tag)
                 # print(f"Results Saved for v={v:.2f} (Shape e.g., train_loss: {final_results_for_v['train_loss'].shape})")
                 plot_loss(filename, head=1)
-                plot_loss(filename, head=2)
+                plot_loss(filename, head=2) 
 
         print(f"\n--- All experiments finished ---\nSaved at {output_dir}\nWith hyper-params: {args}")
 

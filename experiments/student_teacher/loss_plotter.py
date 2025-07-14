@@ -60,6 +60,7 @@ def get_metric_func(metric: str):
 
 
 def load_expert_metric_data(data_dir: Path, verbose: bool=True) -> Tuple[Dict, Dict]:
+    # print(f"Using Expert Data")
     expert_regex = re.compile(r"v_(\d+\.\d+).npz") 
     meta_ref = None
     grouped={}
@@ -98,9 +99,13 @@ def get_expert_losses():
 
     return expert_losses
 
-expert_losses = get_expert_losses()
+expert_losses_default = get_expert_losses()
 
-def calc_metric(data_t1: np.ndarray, data_t2: np.ndarray, run: int, v: int, switch_idx: int, metric: str = 'auc', epochs: list = []):
+def access_default_expert(key):
+    print(f'Using Expert w/ key: {key}')
+    return expert_losses_default[key]
+
+def calc_metric(data_t1: np.ndarray, data_t2: np.ndarray, expert_losses: np.ndarray, run: int, v: int, switch_idx: int, metric: str = 'auc', epochs: list = []):
     # input: data_t1: array shape: (downsampled_epochs,runs) test loss data for task 1
     #        data_t2: array shape: (downsample_epochs, runs) test loss data for task 2
     #        run: which run we are using, index for expert
@@ -117,7 +122,7 @@ def calc_metric(data_t1: np.ndarray, data_t2: np.ndarray, run: int, v: int, swit
     metric_func = get_metric_func(metric)
     metric_ii   = metric_func(jnp.array(data_ii), i_x)
     metric_ij   = metric_func(jnp.array(data_ij), j_x)
-    exp_metric  = metric_func(expert_losses[v].T[:switch_idx,run], i_x)
+    exp_metric  = metric_func(expert_losses.T[:switch_idx,run], i_x)
     data_ji     = data_t2[:switch_idx, run]
     data_jj     = data_t2[switch_idx:, run]
     metric_ji   = metric_func(jnp.array(data_ji), i_x)
@@ -171,7 +176,7 @@ def load_grouped_metric_data(data_dir: Path, verbose: bool=True) -> Tuple[Dict, 
                         for k, v in meta_ref.items():
                             if k != 'g_type' and not np.array_equal(meta.get(k, None), v):
                                 raise ValueError(f"Meta mismatch in {npz_path.name}: {k}")
-
+                    set_trace()
                     grouped[meta['g_type']].append({
                         "v": float(m.group(2)),
                         "g_type": meta['g_type'],
@@ -181,6 +186,7 @@ def load_grouped_metric_data(data_dir: Path, verbose: bool=True) -> Tuple[Dict, 
                         "switch_point": int(meta["switch_point"]),
                         "num_runs": dat["test_loss1"].shape[1],
                         "overlap": dat["overlap"],
+                        "expert_losses": dat.get("expert_test_loss", access_default_expert(float(f'{dat['v']:1f}')))
                     })
             except Exception as e:
                 _log(f"Error reading {npz_path.name}: {e}", verbose)
@@ -228,7 +234,7 @@ def generate_metric_plot(
     try:
         # Get the base path from data_dir (assuming structure: base_path/loss_data/sparsity_X)
         base_path = data_dir.parent.parent
-        # Path to overlap metrics
+    #     # Path to overlap metrics
         overlap_path = Path("/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/overlap_search_plots")
         overlap_file = overlap_path / f"overlap_metrics_{metric}.npz"
         
@@ -241,16 +247,21 @@ def generate_metric_plot(
     except Exception as e:
         print(f"Error loading overlap metrics: {str(e)}")
         overlap_data = None
+
+    
     # ========== END overlap ==========
 
-    metric_names = ("rem", "ft_t1", "ft_t2", "zs")
+    # metric_names = ("rem", "ft_t1", "ft_t2", "zs")
+    metric_names = ("rem", "ft_t2")
+    metric_name_map = {'rem': "Remembering", 'ft_t2': "Forward Transfer"}
     colors = {
         'random': 'rgba(255,0,0,1)',
         'determ': 'rgba(0,0,255,1)',
         'overlap_max': 'rgba(0,128,0,1)'  # Green for overlap max
     }
-    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.09,
-                       subplot_titles=[f"{name.upper()} {metric.upper()}" for name in metric_names])
+    # fig = make_subplots(rows=1, cols=2, shared_xaxes=True, vertical_spacing=0.06,
+    #                 #    subplot_titles=[f"{name.upper()} {metric.upper()}" for name in metric_names] 
+    #                    )
         # g_type  -> metric_name -> MetricSeries
     series: Dict[str, Dict[str, MetricSeries]] = {
         g: {m: MetricSeries() for m in metric_names} for g in colors
@@ -262,11 +273,12 @@ def generate_metric_plot(
     for g_type, exps in grouped.items():
         for exp in sorted(exps, key=lambda e: e["v"]):
             switch_idx = int(np.argmin(np.abs(exp["epochs"] - exp["switch_point"])))
+            # expert_loss = exp.get("expert_losses", expert_losses_default[exp["v"]])
 
             # run‑wise metric computation (your existing helper)
             per_run = [
                 calc_metric(
-                    exp["loss1_raw"], exp["loss2_raw"],
+                    exp["loss1_raw"], exp["loss2_raw"], exp["expert_losses"],
                     r, exp["v"], switch_idx, metric, meta_ref['epochs']
                 )
                 for r in range(exp["loss1_raw"].shape[1])
@@ -276,27 +288,34 @@ def generate_metric_plot(
 
             rem, ft1, ft2, zs = map(np.asarray, zip(*per_run))
             v = float(exp["v"])
-
+            # set_trace()
             overlap_mu = np.mean(exp["overlap"])
-            overlap_sig = np.std(exp["overlap"])
+            overlap_sig = np.std(exp["overlap"]) / np.sqrt(len(exp["overlap"]))
 
             # Store metrics
-            for metric_name, values in zip(metric_names, [rem, ft1, ft2, zs]):
+            # for metric_name, values in zip(metric_names, [rem, ft1, ft2, zs]):
+            for metric_name, values in zip(metric_names, [rem, ft2]):
                 series[g_type][metric_name].v.append(v)
                 series[g_type][metric_name].mu.append(values.mean())
-                series[g_type][metric_name].sig.append(values.std())
+                series[g_type][metric_name].sig.append(values.std() / np.sqrt(len(exp["overlap"]))) 
                 series[g_type][metric_name].overlap_mu.append(overlap_mu)
                 series[g_type][metric_name].overlap_sig.append(overlap_sig)
 
     # ------------------------------------------------------------------
     # Plotting ----------------------------------------------------------
-    # ------------------------------------------------------------------
+    # # ------------------------------------------------------------------
     fig = make_subplots(
-        rows=1, cols=4, shared_xaxes=True, vertical_spacing=0.07, horizontal_spacing=0.06,
-        subplot_titles=[f"{name.upper()} {metric.upper()}" for name in metric_names],
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.02, horizontal_spacing=0.05,
+        # subplot_titles=[f"{name.upper()} {metric.upper()}" for name in metric_names],
     )
+        # # ------------------------------------------------------------------
+    ## for grant figure:
+    # fig = make_subplots(
+    #     rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, horizontal_spacing=0.06,
+    #     # subplot_titles=[f"{name.upper()} {metric.upper()}" for name in metric_names],
+    # ) # end for grant figure
 
-    for col, metric_name in enumerate(metric_names, start=1):
+    for row, metric_name in enumerate(metric_names, start=1): ### change col to row 
         for g_type, colr in colors.items():
             curve = series[g_type][metric_name]
             if not curve.v:
@@ -316,7 +335,7 @@ def generate_metric_plot(
                     legendgroup=g_type,
                     hoverinfo='none',
                 ),
-                row=1, col=col,
+                row=row, col=1, ### change index from col to row
             )
 
             # mean line
@@ -324,9 +343,9 @@ def generate_metric_plot(
                 go.Scatter(
                     x=v, y=m,
                     line=dict(color=colr, width=4),
-                    name=g_type if col == 1 else None,   # one legend entry
+                    name=g_type.upper() if row == 1 else None,   # one legend entry ## change col to row
                     legendgroup=g_type,
-                    showlegend=(col == 1),
+                    showlegend=(row == 1), ### change col to row
                     # HIGHLIGHT START
                     customdata=np.stack([om, osig], axis=-1),
                     hovertemplate=(
@@ -338,11 +357,11 @@ def generate_metric_plot(
                     ),
                     # HIGHLIGHT END
                 ),
-                row=1, col=col,
+                row=row, col=1, ### change col to row
             )       
 
         # axis labels row‑wise
-        fig.update_yaxes(title_text=f"{metric_name}", row=1, col=col, exponentformat='e')
+        fig.update_yaxes(title_text=f"<b>{metric_name_map[metric_name]}</b>", row=row, col=1, exponentformat='e') ### change col to row
         # ========== Plot overlap max metrics ==========
         if overlap_data is not None:
             # Get overlap data for this metric
@@ -364,7 +383,7 @@ def generate_metric_plot(
                     legendgroup='overlap_max',
                     hoverinfo='none',
                 ),
-                row=1, col=col,
+                row=row, col=1, ### change col to 
             )
             
             fig.add_trace(
@@ -374,9 +393,9 @@ def generate_metric_plot(
                     mode='lines+markers',
                     line=dict(color=colors['overlap_max'], width=4, dash='dash'),
                     marker=dict(size=8, color=colors['overlap_max']),
-                    name='Overlap Max' if col == 1 else None,
+                    name='Overlap Max'.upper() if row == 1 else None,
                     legendgroup='overlap_max',
-                    showlegend=(col == 1),
+                    showlegend=(row == 1),
                     customdata=max_overlaps,
                     hovertemplate=(
                     "<b>Overlap Max</b><br>"
@@ -386,23 +405,37 @@ def generate_metric_plot(
                     "<extra></extra>"
                     ),
                 ),
-                row=1, col=col,
+                row=row, col=1,
             )
 
             
         # ========== END overlap plot ==========
 
-    fig.update_xaxes(title_text="similarity v")
+    fig.update_xaxes(title_text="<b>Task Similarity</b>", row=2, col=1)
     fig.update_layout(
-        title=f"CL Metrics: {metric.upper()} curves (mean ± std); Sparsity: {meta_ref['sparsity']}",
-        height=400,
-        width=2000,
+        # title=f"CL Metrics: {metric.upper()} curves (mean ± std); Sparsity: {meta_ref['sparsity']}",
+        height=900,
+        width=600,
         template="plotly_white",
         hovermode="closest", 
         font=dict(
                     family="DejaVu Sans Bold",
-                    size=20,
-                )
+                    size=25,
+                    color="black"
+                ),
+        legend=dict(
+            font=dict(
+                    family="DejaVu Sans Bold",
+                    size=15,
+                    color="black"),
+            yanchor='top',
+            y=0.48,
+            xanchor='left',
+            x=0.06,
+            bordercolor="Black",
+            borderwidth=1,
+            # orientation='h'
+        )
     )
 
     if show_plots:

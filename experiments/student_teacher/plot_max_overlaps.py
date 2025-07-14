@@ -14,12 +14,13 @@ FOLDERS = {
     "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/overlap_search_plots": "Equal Capacity",
     "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/overlap_search/over_capacity_plots": "Over Capacity",
     "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/overlap_search/under_capacity_twolayer_plots": "Two Layers",
+    "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/single_layer_ngg_equalCap_plots": "Noise Gated-Grad"
     # Add more folders as needed:
     # "/path/to/another/folder": "Another Experiment",
 }
 
 # Output directory for plots
-OUTPUT_DIR = "./loss_data/max_overlap_metric_plots_2layer"
+OUTPUT_DIR = "./loss_data/max_overlap_metric_plots_ngg"
 
 # Plot configuration
 METRIC_TITLES = {
@@ -32,6 +33,7 @@ METRIC_COLORS = {
     'Equal Capacity': 'rgb(255,127,14)',              # Orange
     'Over Capacity' : 'rgb(190,174,212)',
     'Two Layers'    : 'rgb(100, 100, 100)',
+    "Noise Gated-Grad": 'rgb(75, 125, 225)',
     # Add more colors as needed:
     # 'Another Experiment': '#2ca02c',  # Green
 }

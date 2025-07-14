@@ -19,7 +19,13 @@ import pickle
 import jax
 import matplotlib.pyplot as plt
 
-from loss_plotter import load_grouped_metric_data, MetricSeries, calc_metric, _log
+from loss_plotter import load_grouped_metric_data, MetricSeries, calc_metric, _log, get_expert_losses
+
+expert_losses_default = get_expert_losses()
+
+def access_default_expert(key):
+    print(f'Using Expert w/ key: {key}')
+    return expert_losses_default[key]
 
 # Define publication-friendly color scales
 COLOR_SCALES = {
@@ -64,7 +70,8 @@ def load_overlap_metric_data(data_dir: Path, verbose: bool=True) -> Tuple[Dict, 
                     for k, v in meta_ref.items():
                         if k != 'g_type' and not np.array_equal(meta.get(k, None), v):
                             raise ValueError(f"Meta mismatch in {npz_path.name}: {k}")
-
+                # set_trace()
+                expert_loss = dat['expert_test_loss'] if "expert_test_loss" in dat else access_default_expert(float(f'{dat['v']:1f}'))
                 grouped[meta['g_type']].append({
                     "v": float(m.group(2)),
                     "g_type": meta['g_type'],
@@ -74,7 +81,8 @@ def load_overlap_metric_data(data_dir: Path, verbose: bool=True) -> Tuple[Dict, 
                     "switch_point": int(meta["switch_point"]),
                     "num_runs": dat["test_loss1"].shape[1],
                     "overlap_output": dat["overlap_output"],
-                    "overlap_var": dat["overlap"]
+                    "overlap_var": dat["overlap"],
+                    "expert_loss": expert_loss
                 })
         except Exception as e:
             _log(f"Error reading {npz_path.name}: {e}", verbose)
@@ -103,10 +111,11 @@ def get_metrics(data_dir: Path, calc_method: str = 'auc', verbose: bool = True, 
             
             # Calculate average overlap for this experiment
             overlap_avg = np.mean(exp["overlap_output"])
-            
+            expert_loss = exp.get("expert_losses", expert_losses_default[exp["v"]])
+
             per_run = [
                 calc_metric(
-                    exp["loss1_raw"], exp["loss2_raw"],
+                    exp["loss1_raw"], exp["loss2_raw"], expert_loss,
                     r, exp["v"], switch_idx, calc_method, meta_ref['epochs']
                 )
                 for r in range(exp["loss1_raw"].shape[1])
@@ -332,7 +341,7 @@ def calculate_max_values(metrics_data: Dict[str, Dict[str, list]], metric_names:
             max_idx = np.argmax(values)
             max_values[metric].append(values[max_idx])
             max_overlaps[metric].append(overlaps[max_idx])
-            max_sigs[metric].append(sigs[max_idx])  # NEW: store corresponding sig
+            max_sigs[metric].append(sigs[max_idx])  # NEW: store corresponding si
     
     return max_values, max_overlaps, max_sigs, np.array(unique_v)  # UPDATED return
 
@@ -463,7 +472,7 @@ def save_figures_to_html(figures: List[go.Figure], filename: Path):
 # ==================== Main Processing (REVAMPED) ====================
 def main():
     # Configuration
-    data_path = "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/overlap_search/under_capacity_twolayer"
+    data_path = "/home/users/MTrappett/mtrl/RepresentationSimilarityCL/loss_data/overlap_network_experiment/under_capacity"
     plots_path = Path(data_path + "_plots")
     plots_path.mkdir(parents=True, exist_ok=True)
     
