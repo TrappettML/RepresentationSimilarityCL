@@ -1,76 +1,169 @@
 import os
+# Option A: read the external env (if launching with CUDA_VISIBLE_DEVICES=...)
+print("ENV CUDA_VISIBLE_DEVICES (before imports):", os.environ.get("CUDA_VISIBLE_DEVICES"))
+
 import argparse
 import pickle
 from functools import partial
 from pathlib import Path
 
 import jax
+
+print("jax.devices():", jax.devices())
+print("jax.local_devices():", jax.local_devices())
+
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
+import plotly.graph_objects as go
+import plotly.express.colors as px_colors
 from flax import linen as nn
 from jax import jit, lax, random, vmap
+from ipdb import set_trace
 
 from make_masks import create_masks
 from timer_class import Timer
 
-# --- Plotting ---
-def plot_losses(npz_path: str | Path, log_y: bool = True, dpi: int = 150) -> None:
-    """Plots training and test losses for all tasks from a results file."""
+from single_expert import train_experts, scaled_normal_init
+
+def plot_losses(npz_path: str | Path, log_y: bool = True) -> None:
+    """
+    Plots training and test losses from a results file using Plotly.
+    This version is robust to missing or invalid expert data and corrects
+    visual artifacts.
+    """
     npz_path = Path(npz_path)
-    data = np.load(npz_path)
+    try:
+        data = np.load(npz_path, allow_pickle=True)
+    except FileNotFoundError:
+        print(f"Error: Results file not found at {npz_path}")
+        return
 
+    # --- Data Loading ---
     epochs = data["epochs"]
-    train_loss = data["train_loss"]          # (num_samples, num_runs)
-    test_losses = data["test_losses"]        # (num_samples, num_runs, ntasks)
-    switch_points = data["switch_points"]
+    train_loss = data["train_loss"]
+    test_losses = data["test_losses"]
+    switch_points = data.get("switch_points", []) # Use .get for safety
     ntasks = test_losses.shape[-1]
-
-    train_mean = train_loss.mean(axis=1)
-    train_std = train_loss.std(axis=1)
-    test_means = test_losses.mean(axis=1)
-    test_stds = test_losses.std(axis=1)
-
-    fig, ax = plt.subplots(figsize=(12, 8))
-
-    # Plot train loss
-    ax.plot(epochs, train_mean, label="Train Loss", color="black")
-    ax.fill_between(epochs, train_mean - train_std, train_mean + train_std,
-                    color="black", alpha=0.2)
-
-    # Plot test losses for each task
-    colors = plt.cm.viridis(np.linspace(0, 1, ntasks))
-    for i in range(ntasks):
-        ax.plot(epochs, test_means[:, i], label=f"Test Loss (Task {i+1})", color=colors[i])
-        ax.fill_between(epochs, test_means[:, i] - test_stds[:, i],
-                        test_means[:, i] + test_stds[:, i],
-                        color=colors[i], alpha=0.2)
     
-    # Add vertical lines at each task switch
+    epochs_per_task = int(data['epochs_per_task'])
+    sample_rate = int(data['sample_rate'])
+
+    
+    # --- Extract similarity and calculate overlap stats ---
+    similarity = data.get('similarity', float('nan'))
+    overlaps = data.get('overlaps', [])
+    overlap_mean = np.mean(overlaps) if len(overlaps) > 0 else float('nan')
+    overlap_std = np.std(overlaps) if len(overlaps) > 0 else float('nan')
+
+    # --- Mean and Std Calculation ---
+    train_mean = train_loss.mean(axis=1)
+    train_sem = train_loss.std(axis=1)/jnp.sqrt(train_loss.shape[1])
+    test_means = test_losses.mean(axis=1)
+    test_sems = test_losses.std(axis=1)/jnp.sqrt(train_loss.shape[1])
+
+    fig = go.Figure()
+    colors = px_colors.qualitative.Plotly
+
+    def add_band(x, y_mean, y_std, name, color, dash=None):
+        """Helper to add a line with a shaded error band."""
+        is_finite = np.isfinite(y_mean) & np.isfinite(y_std)
+        x, y_mean, y_std = x[is_finite], y_mean[is_finite], y_std[is_finite]
+        if len(x) == 0: return
+
+        y_upper, y_lower = y_mean + y_std, y_mean - y_std
+        
+        # *** FIX 1: Corrected alpha value for transparency ***
+        rgba_color = color.replace('rgb', 'rgba').replace(')', ', 0.2)')
+
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([x, x[::-1]]),
+            y=np.concatenate([y_upper, y_lower[::-1]]),
+            fill='toself', fillcolor=rgba_color, opacity=0.2, line_width=0,
+            hoverinfo="none", showlegend=False, legendgroup=name,
+        ))
+        fig.add_trace(go.Scatter(
+            x=x, y=y_mean, name=name,
+            mode='lines', line=dict(color=color, dash=dash, width=2.5),
+            legendgroup=name,
+        ))
+
+    # --- Plot Student Performance ---
+    add_band(epochs, train_mean, train_sem, name="Student Train Loss", color='rgb(0,0,0)')
+    for i in range(ntasks):
+        color = colors[i % len(colors)]
+        add_band(epochs, test_means[:, i], test_sems[:, i], name=f"Student on Task {i+1}", color=color)
+
+    # --- Plot Expert Performance (with Data Validation) ---
+    # *** FIX 2: Check for valid expert data before attempting to plot ***
+    if 'expert_test_losses' not in data or not np.any(np.isfinite(data['expert_test_losses'])):
+        print("\nWarning: 'expert_test_losses' key not found in npz file or contains no valid data.")
+        print("         Skipping expert plots. Please check the 'train_experts' function.\n")
+    else:
+        expert_losses = data['expert_test_losses']
+        expert_means = expert_losses.mean(axis=0)
+        expert_sems = expert_losses.std(axis=0)/jnp.sqrt(expert_losses.shape[0])
+        expert_sampled_steps = np.arange(0, epochs_per_task, sample_rate)
+
+        for i in range(ntasks):
+            # *** FIX 3: Safeguard against length mismatch ***
+            y_mean_segment = expert_means[i, :]
+            num_samples = len(y_mean_segment)
+            x_segment = expert_sampled_steps[:num_samples] + (i * epochs_per_task)
+
+            if len(x_segment) != len(y_mean_segment):
+                print(f"Warning: Skipping expert plot for task {i+1} due to data length mismatch.")
+                continue
+
+            add_band(
+                x_segment, y_mean_segment, expert_sems[i, :],
+                name=f"Expert on Task {i+1}", color=colors[i % len(colors)], dash='dash'
+            )
+
+    # --- Add Task Switch Lines ---
     for sp in switch_points:
-        ax.axvline(x=sp, color='r', linestyle='--', alpha=0.7)
+        fig.add_vline(x=sp, line_width=1.5, line_dash="dash", line_color="rgba(255, 0, 0, 0.8)")
+    
 
-    ax.set_xlabel("Training Step")
-    ax.set_ylabel("Mean Squared Error")
-    ax.set_title(npz_path.stem)
-    if log_y:
-        ax.set_yscale("log")
-    ax.legend()
-    ax.grid(True, which="both", ls="--", alpha=0.3)
+    # --- Final Touches ---
+    fig.update_layout(
+        title_text=(
+            f"Student vs. Expert Performance on {ntasks} Tasks<br>"
+            f"Task Similarity (v): {similarity:.2f}, "
+            f"Overlap: mean={overlap_mean:.2f}, std={overlap_std:.2f}"
+        ),
+        xaxis_title="Training Step", yaxis_title="Mean Squared Error",
+        yaxis_type="log" if log_y else "linear",
+        legend_title_text="Legend", template="plotly_white",
+        font=dict(family="Arial, sans-serif", size=14, color="black"),
+        legend=dict(groupclick="togglegroup")
+    )
 
-    out_png = npz_path.with_suffix(".png")
-    fig.savefig(out_png, dpi=dpi, bbox_inches="tight")
-    print(f"Saved figure -> {out_png.resolve()}")
-    plt.close(fig)
+    out_html = npz_path.with_suffix(".html")
+    fig.write_html(out_html, include_plotlyjs='cdn')
+    print(f"Saved figure -> {out_html.resolve()}")
 
 
-# --- Model Definitions ---
-def scaled_normal_init(scale: float):
-    """Returns a function for scaled normal initialization."""
-    def init(key, shape, dtype=jnp.float32):
-        return scale * random.normal(key, shape, dtype)
-    return init
+
+# Define a function with custom forward and backward behavior
+@jax.custom_vjp
+def mask_backward(x, mask):
+    # Standard forward pass - no masking
+    return x
+
+# Define forward rule - same as standard forward pass
+def mask_backward_fwd(x, mask):
+    return mask_backward(x, mask), mask
+
+# Define backward rule - apply mask to gradients
+def mask_backward_bwd(mask, g):
+    # Return gradient masked by the provided mask
+    return (g * mask, None)
+
+# Register the custom VJP
+mask_backward.defvjp(mask_backward_fwd, mask_backward_bwd)
+
 
 class StudentHead(nn.Module):
     """A single output head for the student network."""
@@ -87,7 +180,7 @@ class StudentNetwork(nn.Module):
     """Student network with a shared backbone and task-specific masked heads."""
     hidden_dim: int
     head_hidden_dim: int # In this refactor, this is effectively the same as hidden_dim
-
+    d_in: int
     def setup(self):
         # The single head layer, whose weights will be applied to different masked inputs
         self.head_layer = StudentHead(name="head")
@@ -95,7 +188,7 @@ class StudentNetwork(nn.Module):
             self.hidden_dim,
             use_bias=False,
             name="masked_layer1",
-            kernel_init=scaled_normal_init(jnp.sqrt(2 / self.hidden_dim))
+            kernel_init=scaled_normal_init(jnp.sqrt(2 / self.d_in))
         )
 
     @nn.compact
@@ -106,18 +199,22 @@ class StudentNetwork(nn.Module):
         def apply_mask_and_head(mask):
             """Applies a single mask and passes the result through the head."""
             norm = jnp.sqrt(jnp.maximum(mask.sum(), 1e-8))
-            masked_h = (h * mask) / norm
-            return self.head_layer(masked_h).squeeze(-1)
+            # masked_h = (h * mask) / norm
+            hidden = mask_backward(h, mask) / norm
+            return self.head_layer(hidden).squeeze(-1)
 
         # vmap over the masks to get an output for each task
         masks_array = jnp.stack(masks, axis=0)
         outputs = vmap(apply_mask_and_head)(masks_array)
         return outputs
 
-def teacher_forward(params, x):
-    """A simple two-layer teacher network forward pass."""
-    h = nn.relu(x @ params['w1'])
-    return h @ params['w2']
+def teacher_forward(params: dict, x:jnp.ndarray)->jnp.ndarray:
+    """A simple two-layer teacher network forward pass for a batch of inputs."""
+    # x shape: (batch_size, d_in)
+    # params['w1'] shape: (d_in, d_ht)
+    h = nn.relu(x @ params['w1']) # Result shape: (batch_size, d_ht)
+    # params['w2'] shape: (d_ht, 1)
+    return (h @ params['w2']).squeeze(-1) # Result shape: (batch_size)
 
 
 # --- Core Training & Evaluation Logic ---
@@ -188,8 +285,10 @@ def train_single_task(
         params_batch, opt_state_batch, keys_batch, masks_batch = carry
 
         # Generate a new batch of data for all runs
-        keys_batch, subkeys_batch = jnp.split(random.split(keys_batch, 2 * keys_batch.shape[0]).reshape(keys_batch.shape[0], 2, -1), 2, axis=1)
-        keys_batch, subkeys_batch = keys_batch.squeeze(1), subkeys_batch.squeeze(1)
+        split_fn = vmap(lambda k: random.split(k, 2))
+        all_keys = split_fn(keys_batch)
+        keys_batch = all_keys[:, 0, :]  # New keys for next iteration
+        subkeys_batch = all_keys[:, 1, :]  # Subkeys for data generation
         batch_data = vmap(lambda k: random.normal(k, (batch_size, d_in)))(subkeys_batch)
 
         # Compute gradients for the current task
@@ -241,12 +340,12 @@ def run_training_loop(
     # vmap mask creation over the number of runs
     vmap_create_masks = vmap(create_masks, in_axes=(None, None, None, None, None, 0, None))
     masks_batch, m_overlap = vmap_create_masks(
-        d_hs, config['sparsity'], config['similarities'], config['overlap'], ## this will throw an error
+        d_hs, config['sparsity'], config['similarity'], config['overlap'],
         config['g_type'], random.split(mask_keys, num_runs), ntasks
     ) # masks_batch is a PyTree of shape (num_runs, ntasks, ...)
 
     # vmap state creation over the number of runs
-    student_net = StudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs)
+    student_net = StudentNetwork(hidden_dim=d_h, head_hidden_dim=d_hs, d_in=config['d_in'])
     vmap_create_state = vmap(
         lambda k, m: student_net.init(k, jnp.ones((1, d_in)), m)['params'],
         in_axes=(0, 0)
@@ -257,6 +356,10 @@ def run_training_loop(
     # --- Pre-compute all test targets ---
     # `all_teacher_params` has shape (num_runs, ntasks, ...)
     # We want `all_teacher_targets` to be (num_runs, ntasks, test_size)
+    # for k,v in all_teacher_params.items():
+    #     jax.debug.print("all_teacher_params keys {x}", x=k)
+    #     jax.debug.print("all teacher shapes: {x}", x=v.shape)
+    # jax.debug.print("test_inputs shape: {x}", x=test_inputs.shape)
     vmap_teacher_forward = vmap(vmap(teacher_forward, in_axes=(0, None)), in_axes=(0, None))
     all_teacher_test_targets = vmap_teacher_forward(all_teacher_params, test_inputs)
 
@@ -327,32 +430,28 @@ def compute_weight_vectors(C:jnp.array, basis_vectors: jnp.array)->jnp.array:
 
 
 @partial(jax.jit, static_argnames=('d_ht', 'd_in'))
-def generate_single_teacher_w1(key: jnp.ndarray, v: int, U: jnp.ndarray, d_ht: int, d_in: int) -> jnp.ndarray:
+def generate_single_teacher_w1(v: int, U: jnp.ndarray, d_ht: int, d_in: int) -> jnp.ndarray:
     K = U.shape[1]
     C = get_C(v, K)
-    W = compute_weight_vectors(C, U)
-    k_select = jax.random.randint(key, shape=(), minval=0, maxval=K)
-    W_k = W[:, k_select]
-    return W_k.reshape((d_in, d_ht))
+    W = U @ C # should be (d_in*d_ht, K)
+    return W.T.reshape((K, d_in, d_ht))
 
     
-def get_all_teacher_weights(key: jnp.ndarray, num_runs: int, ntasks: int, d_in: int, d_ht: int, similarities: jnp.ndarray):
+def get_all_teacher_weights(key: jnp.ndarray, num_runs: int, ntasks: int, d_in: int, d_ht: int, similarity: int):
     """
-    Generates teacher weights for all runs and tasks based on a vector of similarities.
+    Generates teacher weights for all runs and tasks based on a single simlarity.
     
     This implementation uses a shared orthonormal basis `U` for each run. For each task,
     a set of correlated vectors is generated from this basis using the task-specific
     similarity value `v`, and one vector is randomly chosen to be the teacher's `w1`.
     """
-    assert similarities.shape == (ntasks,), "Length of similarities vector must equal ntasks."
     
     run_keys = random.split(key, num_runs) # One key per run
 
     @jax.jit
-    def create_teachers_for_one_run(run_key: jnp.ndarray, similarities_vec: jnp.ndarray):
+    def create_teachers_for_one_run(run_key: jnp.ndarray):
         # --- 1. Setup for the run ---
-        U_key, w2_key, task_keys_key = random.split(run_key, 3)
-        task_keys = random.split(task_keys_key, ntasks) # One key per task for selection
+        U_key, w2_key = random.split(run_key, 2)
 
         # --- 2. Create shared orthonormal basis `U` for this run ---
         # K (number of basis vectors) is set to ntasks.
@@ -361,17 +460,13 @@ def get_all_teacher_weights(key: jnp.ndarray, num_runs: int, ntasks: int, d_in: 
         # U contains K orthonormal vectors, each of size flattened_dim.
         U = random.orthogonal(U_key, n=flattened_dim, m=K) # Shape: (d_in * d_ht, K)
         
-        # --- 3. Generate `w1` for each task by vmapping over similarities ---
-        # We vmap the generation function over the similarities vector and task keys.
-        vmap_gen_w1 = vmap(
-            generate_single_teacher_w1,
-            in_axes=(0, 0, None, None, None), # vmap over key and v; U is broadcast
-        )
-        all_w1s = vmap_gen_w1(task_keys, similarities_vec, U, d_in, d_ht) # Shape: (ntasks, d_in, d_ht)
+        # generate similar task weight w_1
+        all_w1s = generate_single_teacher_w1(similarity, U, d_ht, d_in)
 
         # --- 4. Generate a single shared `w2` for this run ---
         w2 = random.normal(w2_key, (d_ht, 1)) # Shape: (d_ht, 1)
-        w2 /= jnp.linalg.norm(w2, axis=0, keepdims=True) + 1e-8 # Normalize
+        # we don't need to normalize we could if we wanted to
+        # w2 /= jnp.linalg.norm(w2, axis=0, keepdims=True) + 1e-8 # Normalize 
 
         # --- 5. Combine and return ---
         # We stack w2 to match the number of tasks for consistent tree structure.
@@ -379,62 +474,70 @@ def get_all_teacher_weights(key: jnp.ndarray, num_runs: int, ntasks: int, d_in: 
         return {'w1': all_w1s, 'w2': all_w2s}
 
     # Vmap the entire run-generation process over the number of runs.
-    # The similarities vector is the same for all runs.
-    all_params = vmap(
-        create_teachers_for_one_run,
-        in_axes=(0, None), # vmap over run_keys; similarities_vec is broadcast
-    )(run_keys, similarities) # Final shape e.g. w1: (num_runs, ntasks, d_in, d_ht)
-
+    all_params = vmap(create_teachers_for_one_run)(run_keys) # Final shape e.g. w1: (num_runs, ntasks, d_in, d_ht)
+    # jax.debug.breakpoint()
     return all_params
 
 
 def setup_and_run_experiment(config):
     """Sets up and runs a full experiment for a given configuration."""
-    # --- Setup ---
     key = random.PRNGKey(config['seed'])
     output_dir = Path(config['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"Running experiment with config:\n{config}")
+    print("=" * 50)
+    print(f"Running experiment with config:")
+    for k, v in config.items():
+        print(f"  {k}: {v}")
+    print("=" * 50)
     
     # --- Create Model and Optimizer ---
-    student_model = StudentNetwork(hidden_dim=config['d_h'], head_hidden_dim=config['d_hs'])
+    student_model = StudentNetwork(hidden_dim=config['d_h'], head_hidden_dim=config['d_hs'], d_in=config['d_in'])
     optimizer = optax.sgd(config['lr'])
+    expert_optimizer = optax.sgd(config['lr'])
 
     # --- Create Teacher Weights and Test Data ---
     teacher_key, test_key, run_key = random.split(key, 3)
     
-    # Generate weights for all runs and tasks using the new method
     all_teacher_params = get_all_teacher_weights(
         teacher_key, config['num_runs'], config['ntasks'],
-        config['d_in'], config['d_ht'], jnp.array(config['similarities']) # Pass similarities vector
+        config['d_in'], config['d_ht'], jnp.array(config['similarity'])
     )
 
-    # Create a single batch of test data, shared across all runs
     test_inputs = random.normal(test_key, (config['test_size'], config['d_in']))
 
-    # --- Run Training ---
-    with Timer("Total training and evaluation"):
-        train_loss, test_losses, masks = run_training_loop(
+    # --- Run Student Training ---
+    with Timer("Total student training and evaluation"):
+        train_loss, test_losses, masks, overlaps = run_training_loop(
             run_key, config, student_model, optimizer, test_inputs, all_teacher_params
         )
+
+    # --- Run Expert Training ---
+    expert_key = random.fold_in(run_key, 42) # Derived key for reproducibility
+    expert_test_losses = train_experts(
+        expert_key, config, expert_optimizer, test_inputs, all_teacher_params
+    )
 
     # --- Save Results ---
     total_epochs = config['ntasks'] * config['epochs_per_task']
     epochs_array = np.arange(0, total_epochs, config['sample_rate'])
     switch_points = [i * config['epochs_per_task'] for i in range(1, config['ntasks'])]
 
+    # Use a dictionary that can be loaded with allow_pickle=True
+    config_to_save = {k: v for k, v in config.items() if isinstance(v, (int, float, str, list, tuple))}
+
     results = {
         "train_loss": np.array(train_loss),
         "test_losses": np.array(test_losses),
         "epochs": epochs_array,
         "switch_points": switch_points,
+        "expert_test_losses": np.array(expert_test_losses),
         "masks": {f"mask_{i}": mask for i, mask in enumerate(masks)},
-        **config # Save the config for reproducibility
+        "overlaps": overlaps,
+        **config_to_save
     }
     
-    sim_str = "_".join([f"{s:.2f}" for s in config['similarities']]).replace('.', 'p')
-    filename = output_dir / f"ntasks_{config['ntasks']}_sim_{sim_str}.npz"
+    filename = output_dir / f"ntasks_{config['ntasks']}_sim_{config['similarity']}.npz"
     np.savez(filename, **results)
     print(f"Results saved to {filename}")
 
@@ -444,59 +547,50 @@ def setup_and_run_experiment(config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Generalized Student-Teacher Experiment")
-    parser.add_argument("--d_hs", type=int, default=1000, help="Student head hidden dimension")
-    parser.add_argument("--d_ht", type=int, default=100, help="Teacher hidden dimension")
+    # parser.add_argument("--d_hs", type=int, default=1000, help="Student hidden dimension")
+    # parser.add_argument("--d_ht", type=int, default=200, help="Teacher hidden dimension")
     parser.add_argument("--d_in", type=int, default=800, help="Input dimension")
-    parser.add_argument("--ntasks", type=int, default=3, help="Number of tasks to train on sequentially")
-    parser.add_argument("--num_epochs", type=int, default=250_000, help="Total training steps across all tasks")
+    parser.add_argument("--ntasks", type=int, default=2, help="Number of tasks to train on sequentially")
+    parser.add_argument("--num_epochs", type=int, default=50_000, help="Total training steps for each task")
     parser.add_argument("--lr", type=float, default=0.1, help="Learning rate")
     # parser.add_argument("--sparsity", type=float, default=0.5, help="Sparsity level for masks")
-    parser.add_argument("--g_type", type=str, default="random", help="Mask generation type ('random', 'determ', 'overlap')")
-    parser.add_argument("--overlap", type=float, default=0.0, help="Shared units between task masks")
-    parser.add_argument("--num_runs", type=int, default=10, help="Number of independent runs to average over")
-    parser.add_argument("--path", type=str, default="./results/n_task_demo", help="Parent directory for output")
+    parser.add_argument("--g_type", type=str, default="overlap", help="Mask generation type ('random', 'determ', 'overlap')")
+    parser.add_argument("--overlap", type=float, default=0.5, help="Shared units between task masks")
+    parser.add_argument("--num_runs", type=int, default=15, help="Number of independent runs to average over")
+    parser.add_argument("--v", type=float, default=0.5, help='Simimlarity between teacher weights for all tasks')
+    parser.add_argument("--path", type=str, default="./results/ntasks_grad_mask_demo/overlap_search/", help="Parent directory for output")
 
     args = parser.parse_args()
-    sparsity = 1/args.ntasks
-    similarities = [i/args.ntasks for i in range(args.ntasks)]
-    """    # --- Process similarities argument ---
-    sim_values_str = args.similarities.split(',')
-    try:
-        similarities = [float(v) for v in sim_values_str]
-    except ValueError:
-        raise ValueError(f"Invalid format for --similarities. Expected comma-separated floats, got {args.similarities}")
-
-    if len(similarities) == 1 and args.ntasks > 1:
-        # If one value is provided, repeat it for all tasks
-        similarities = similarities * args.ntasks
-    elif len(similarities) != args.ntasks:
-        raise ValueError(f"Number of similarity values ({len(similarities)}) must match ntasks ({args.ntasks}) or be 1.")"""
-
+    density = 1/args.ntasks
+    sparsity = 1 - density # assures that we can have non-overlapping masks
+    similarity = args.v
+    d_ht = 200 # we want our network to be capable of perfectly learning the tasks w/ zero overlap
+    d_hs = 200 * args.ntasks
     # --- Build Configuration ---
     epochs_per_task = args.num_epochs 
     total_epochs = args.num_epochs *  args.ntasks
     # sim_str_for_path = "_".join([f"{s:.2f}" for s in similarities]).replace('.', 'p')
     output_dir_str = (
         f"{args.path}/ntasks_{args.ntasks}_sparsity_{sparsity:.2f}"
-        f"_overlap_{args.overlap:.2f}_gtype_{args.g_type}/"
+        f"_overlap_{args.overlap:.2f}_gtype_{args.g_type}_v_{args.v}/"
     )
 
 
     config = {
         "d_in": args.d_in,
-        "d_h": args.d_hs,  # Shared and masked layers have same dimension
-        "d_hs": args.d_hs,
-        "d_ht": args.d_ht,
+        "d_h": d_hs,  # Shared and masked layers have same dimension
+        "d_hs": d_hs,
+        "d_ht": d_ht,
         "ntasks": args.ntasks,
         "num_runs": args.num_runs,
         "lr": args.lr,
-        "num_epochs": args.num_epochs,
+        "total_epochs": total_epochs,
         "epochs_per_task": epochs_per_task,
-        "sample_rate": 10_000,
+        "sample_rate": 1_000,
         "batch_size": 256,
         "test_size": 10_000,
         "sparsity": sparsity, # Enough capacity for separate subnetworks
-        "similarities": similarities,
+        "similarity": args.v,
         "overlap": args.overlap,
         "g_type": args.g_type,
         "seed": 42,

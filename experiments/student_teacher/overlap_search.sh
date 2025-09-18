@@ -12,7 +12,7 @@ for overlap in "${overlap_values[@]}"; do
     echo "------------------------------------------------------------"
     
     # Run the Python script with current parameters
-    python experiments/student_teacher/run_cl.py \
+    python experiments/student_teacher/run_ntasks.py \
         --overlap "$overlap" \
         --g_type "overlap" \
 

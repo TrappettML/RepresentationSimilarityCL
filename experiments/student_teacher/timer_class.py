@@ -18,7 +18,7 @@ def get_peak_memory_usage():
     return f"Peak memory usage: {usage_mb:.2f} MB"
 
 class Timer:
-    def __init__(self, func=None, print_time=True, log_file=None, show_memory=False):
+    def __init__(self, func=None, print_time=True, log_file=None, show_memory=False, text: str=None):
         """
         Initialize the Timer.
         
@@ -31,6 +31,7 @@ class Timer:
         self.print_time = print_time
         self.log_file = log_file
         self.show_memory = show_memory
+        self.text = text
         if func is not None:
             update_wrapper(self, func)
 
@@ -63,6 +64,8 @@ class Timer:
             # Conditionally add memory info if enabled
             if self.show_memory:
                 memory_info = get_peak_memory_usage()
+                if self.text:
+                    self._log(self.text)
                 self._log(f"{self.func.__name__} took {execution_time:.4f} seconds. {memory_info}")
             else:
                 self._log(f"{self.func.__name__} took {execution_time:.4f} seconds.")
@@ -79,9 +82,12 @@ class Timer:
         # Conditionally add memory info if enabled
         if self.show_memory:
             memory_info = get_peak_memory_usage()
+            if self.text:
+                    self._log(self.text)
             self._log(f"Code block took {execution_time:.4f} seconds. {memory_info}")
         else:
             self._log(f"Code block took {execution_time:.4f} seconds.")
+
 
 if __name__ == '__main__':
     # Example usage as a decorator with memory logging enabled
